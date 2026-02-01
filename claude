@@ -120,8 +120,10 @@ def kill_session(session_name: str):
     remove_session_from_state(session_name)
 
 
-def attach_session(session_name: str):
+def attach_session(session_name: str, show_detach_hint: bool = False):
     """Attach to an existing tmux session."""
+    if show_detach_hint:
+        print("\033[90mTip: Press Ctrl-b d to detach (leaves session running)\033[0m\n")
     os.execvp("tmux", ["tmux", "attach", "-t", session_name])
 
 
@@ -324,14 +326,14 @@ def print_help():
     -h, --help        Show this help message
     --list            List sessions for current workspace
     --list-all        List all sessions across all workspaces
-    --connect N       Connect to session N from --list-all
+    --attach N        Attach to session N from --list-all
     --kill N          Kill session N from --list-all
     --kill-orphans    Kill all detached sessions
 
 \033[1mEXAMPLES:\033[0m
     claude                    Interactive menu for current workspace
     claude --list-all         Show all sessions with numbers
-    claude --connect 2        Connect to session #2 from list
+    claude --attach 2         Attach to session #2 from list
     claude -- --resume        Start claude with --resume flag
     claude --kill 2           Kill session #2 from list
 """)
@@ -387,10 +389,10 @@ def main():
                 print()
         sys.exit(0)
 
-    # Check for --connect flag
-    if wrapper_args and wrapper_args[0] == "--connect":
+    # Check for --attach flag
+    if wrapper_args and wrapper_args[0] == "--attach":
         if len(wrapper_args) < 2:
-            print("\033[31mError: --connect requires a session number\033[0m")
+            print("\033[31mError: --attach requires a session number\033[0m")
             print("Use --list-all to see available sessions")
             sys.exit(1)
         try:
@@ -407,7 +409,7 @@ def main():
             session_pwd = session["pwd"]
             if session_pwd != "unknown" and os.path.isdir(session_pwd):
                 os.chdir(session_pwd)
-            attach_session(session["name"])
+            attach_session(session["name"], show_detach_hint=True)
         except ValueError:
             print(f"\033[31mError: '{wrapper_args[1]}' is not a valid number\033[0m")
             sys.exit(1)
