@@ -131,16 +131,20 @@ def start_new_session(session_name: str, args: list):
     env_flags = os.environ.get("CLAUDE_TMUX_FLAGS", "").split()
     all_args = env_flags + args
     cmd = " ".join([REAL_CLAUDE] + all_args)
-    # Create detached session first, configure it, then attach
+
+    # Create detached session with the command
     subprocess.run([
         "tmux", "new-session", "-d", "-s", session_name, cmd
     ], check=True)
+
+    # Disable smcup/rmcup so errors stay visible after tmux exits (no screen restore)
+    subprocess.run(["tmux", "set", "-g", "terminal-overrides", "xterm*:smcup@:rmcup@"])
     # Disable status bar for minimal interference
     subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
     # Enable mouse for scrollback, set large history buffer
     subprocess.run(["tmux", "set", "-t", session_name, "mouse", "on"])
     subprocess.run(["tmux", "set", "-t", session_name, "history-limit", "50000"])
-    # Now attach
+    # Attach
     os.execvp("tmux", ["tmux", "attach", "-t", session_name])
 
 
