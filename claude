@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+claude-wrapper: Smart tmux wrapper for Claude Code
+Manages persistent Claude Code sessions across VS Code disconnections.
+"""
+
+import subprocess
+import os
+import sys
+import hashlib
+import json
+from pathlib import Path
+from datetime import datetime
+
+# Config
+REAL_CLAUDE = str(Path.home() / ".local/bin/claude")
+STATE_FILE = Path.home() / ".claude-sessions.json"
+SESSION_PREFIX = "cc"
+
+
+def get_workspace_hash(pwd: str) -> str:
+    """Generate short hash from workspace path."""
+    return hashlib.md5(pwd.encode()).hexdigest()[:8]
+
+
+def load_state() -> dict:
+    """Load session state from file."""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, IOError):
+            return {"sessions": {}}
+    return {"sessions": {}}
+
+
+def save_state(state: dict):
+    """Save session state to file."""
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def get_tmux_sessions() -> dict:
+    """Get all tmux sessions with their status."""
+    result = subprocess.run(
+        ["tmux", "ls", "-F", "#{session_name}|#{session_attached}|#{session_created}"],
+        capture_output=True,
+        text=True
+    )
+    
+    sessions = {}
+    if result.returncode == 0:
+        for line in result.stdout.strip().split("\n"):
+            if line and line.startswith(SESSION_PREFIX):
+                parts = line.split("|")
+                if len(parts) >= 2:
+                    name = parts[0]
+                    attached = parts[1] == "1"
+                    created = parts[2] if len(parts) > 2 else ""
+                    sessions[name] = {
+                        "attached": attached,
+                        "created": created
+                    }
+    return sessions
+
+
+def get_sessions_for_workspace(pwd: str) -> list:
+    """Get all sessions matching current workspace."""
+    workspace_hash = get_workspace_hash(pwd)
+    tmux_sessions = get_tmux_sessions()
+    state = load_state()
+    
+    matching = []
+    for name, info in tmux_sessions.items():
+        # Check if session belongs to this workspace
+        if f"-{workspace_hash}-" in name:
+            session_state = state.get("sessions", {}).get(name, {})
+            matching.append({
+                "name": name,
+                "attached": info["attached"],
+                "created": info["created"],
+                "pwd": session_state.get("pwd", pwd)
+            })
+    
+    return sorted(matching, key=lambda x: x["name"])
+
+
+def create_new_session(pwd: str) -> str:
+    """Create a new tmux session name."""
+    workspace_hash = get_workspace_hash(pwd)
+    
+    # Find next available number
+    existing = get_tmux_sessions()
+    n = 1
+    while f"{SESSION_PREFIX}-{workspace_hash}-{n}" in existing:
+        n += 1
+    
+    session_name = f"{SESSION_PREFIX}-{workspace_hash}-{n}"
+    
+    # Record in state
+    state = load_state()
+    state["sessions"][session_name] = {
+        "pwd": pwd,
+        "created": datetime.now().isoformat()
+    }
+    save_state(state)
+    
+    return session_name
+
+
+def remove_session_from_state(session_name: str):
+    """Remove a session from our state file."""
+    state = load_state()
+    if session_name in state.get("sessions", {}):
+        del state["sessions"][session_name]
+        save_state(state)
+
+
+def kill_session(session_name: str):
+    """Kill a tmux session."""
+    subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+    remove_session_from_state(session_name)
+
+
+def attach_session(session_name: str):
+    """Attach to an existing tmux session."""
+    os.execvp("tmux", ["tmux", "attach", "-t", session_name])
+
+
+def start_new_session(session_name: str, args: list):
+    """Start a new tmux session with claude (dumb terminal mode)."""
+    # Prepend any flags from CLAUDE_TMUX_FLAGS environment variable
+    env_flags = os.environ.get("CLAUDE_TMUX_FLAGS", "").split()
+    all_args = env_flags + args
+    cmd = " ".join([REAL_CLAUDE] + all_args)
+    # Create detached session first, configure it, then attach
+    subprocess.run([
+        "tmux", "new-session", "-d", "-s", session_name, cmd
+    ], check=True)
+    # Disable status bar for minimal interference
+    subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
+    # Enable mouse for scrollback, set large history buffer
+    subprocess.run(["tmux", "set", "-t", session_name, "mouse", "on"])
+    subprocess.run(["tmux", "set", "-t", session_name, "history-limit", "50000"])
+    # Now attach
+    os.execvp("tmux", ["tmux", "attach", "-t", session_name])
+
+
+def print_menu(sessions: list, pwd: str):
+    """Print the session selection menu. Returns (detached, attached) with indices."""
+    print("\n\033[1;36m╔══════════════════════════════════════════════════════════════╗\033[0m")
+    print("\033[1;36m║\033[0m  \033[1mClaude Code Session Manager\033[0m                                 \033[1;36m║\033[0m")
+    print("\033[1;36m╚══════════════════════════════════════════════════════════════╝\033[0m")
+    print(f"\n\033[90mWorkspace: {pwd}\033[0m\n")
+
+    detached = [s for s in sessions if not s["attached"]]
+    attached = [s for s in sessions if s["attached"]]
+
+    idx = 1
+    if detached:
+        print("\033[1;33m⚡ DETACHED (can reconnect):\033[0m")
+        for s in detached:
+            print(f"   \033[1;32m{idx})\033[0m {s['name']} \033[1;32m[AVAILABLE]\033[0m")
+            idx += 1
+        print()
+
+    if attached:
+        print("\033[90m🔒 ATTACHED (in use):\033[0m")
+        for s in attached:
+            print(f"   \033[90m{idx})\033[0m {s['name']} \033[90m[IN USE]\033[0m")
+            idx += 1
+        print()
+
+    if not sessions:
+        print("\033[90m   No existing sessions for this workspace.\033[0m\n")
+
+
+def print_options():
+    """Print the options menu."""
+    print("\033[1mOptions:\033[0m")
+    print("   \033[1m[1-9]\033[0m    Connect to detached session")
+    print("   \033[1m[n]\033[0m      New session")
+    print("   \033[1m[k N]\033[0m    Kill session N")
+    print("   \033[1m[q]\033[0m      Quit")
+    print()
+
+
+def get_ordered_sessions(sessions: list) -> tuple:
+    """Return (all_ordered, detached, attached) - detached first, then attached."""
+    detached = [s for s in sessions if not s["attached"]]
+    attached = [s for s in sessions if s["attached"]]
+    return detached + attached, detached, attached
+
+
+def do_kill_session(idx: int, all_ordered: list, pwd: str, args: list) -> bool:
+    """Kill session at idx. Returns True if should exit menu, False to continue."""
+    if 0 <= idx < len(all_ordered):
+        session_name = all_ordered[idx]["name"]
+        kill_session(session_name)
+        print(f"   \033[31mKilled {session_name}\033[0m")
+        # Refresh and reshow
+        sessions = get_sessions_for_workspace(pwd)
+        all_ordered, detached, _ = get_ordered_sessions(sessions)
+        if not detached:
+            print("\n\033[90mNo more detached sessions. Starting new...\033[0m")
+            session_name = create_new_session(pwd)
+            start_new_session(session_name, args)
+            return True
+        print_menu(sessions, pwd)
+        print_options()
+        return False
+    else:
+        print("   \033[31mInvalid number\033[0m")
+        return False
+
+
+def interactive_menu(pwd: str, args: list):
+    """Show interactive menu for session management."""
+    sessions = get_sessions_for_workspace(pwd)
+    all_ordered, detached, attached = get_ordered_sessions(sessions)
+
+    # If no detached sessions, just start a new one
+    if not detached:
+        if not sessions:
+            print("\033[90mStarting new Claude Code session...\033[0m")
+        else:
+            print("\033[90mNo detached sessions. Starting new...\033[0m")
+        session_name = create_new_session(pwd)
+        start_new_session(session_name, args)
+        return
+
+    # Show menu
+    print_menu(sessions, pwd)
+    print_options()
+
+    while True:
+        try:
+            choice = input("\033[1;32m>\033[0m ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+
+        # Refresh session lists
+        sessions = get_sessions_for_workspace(pwd)
+        all_ordered, detached, attached = get_ordered_sessions(sessions)
+
+        if choice == 'q':
+            sys.exit(0)
+
+        elif choice == 'n':
+            session_name = create_new_session(pwd)
+            start_new_session(session_name, args)
+            return
+
+        elif choice.startswith('k '):
+            # Shorthand: k N to kill session N directly
+            try:
+                idx = int(choice[2:].strip()) - 1
+                if do_kill_session(idx, all_ordered, pwd, args):
+                    return
+            except ValueError:
+                print("   \033[31mInvalid input\033[0m")
+
+        elif choice == 'k':
+            print("\n   Enter session number to kill (or 'c' to cancel): ", end="")
+            try:
+                kill_choice = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+
+            if kill_choice == 'c':
+                print_menu(sessions, pwd)
+                print_options()
+                continue
+
+            try:
+                idx = int(kill_choice) - 1
+                if do_kill_session(idx, all_ordered, pwd, args):
+                    return
+            except ValueError:
+                print("   \033[31mInvalid input\033[0m")
+
+        elif choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(detached):
+                attach_session(detached[idx]["name"])
+                return
+            elif idx < len(all_ordered):
+                print("   \033[31mCan't connect - session is attached elsewhere\033[0m")
+            else:
+                print("   \033[31mInvalid number\033[0m")
+        
+        else:
+            print("   \033[31mUnknown option\033[0m")
+
+
+def get_all_sessions_list() -> list:
+    """Get all sessions as a numbered list."""
+    all_sessions = get_tmux_sessions()
+    state = load_state()
+    result = []
+    for name, info in sorted(all_sessions.items()):
+        pwd_info = state.get("sessions", {}).get(name, {}).get("pwd", "unknown")
+        result.append({
+            "name": name,
+            "attached": info["attached"],
+            "pwd": pwd_info
+        })
+    return result
+
+
+def print_help():
+    """Print usage information."""
+    print("""
+\033[1mClaude Code Session Manager\033[0m
+
+\033[1mUSAGE:\033[0m
+    claude [OPTIONS] [-- CLAUDE_ARGS...]
+
+\033[1mOPTIONS:\033[0m
+    -h, --help        Show this help message
+    --list            List sessions for current workspace
+    --list-all        List all sessions across all workspaces
+    --connect N       Connect to session N from --list-all
+    --kill N          Kill session N from --list-all
+    --kill-orphans    Kill all detached sessions
+
+\033[1mEXAMPLES:\033[0m
+    claude                    Interactive menu for current workspace
+    claude --list-all         Show all sessions with numbers
+    claude --connect 2        Connect to session #2 from list
+    claude -- --resume        Start claude with --resume flag
+    claude --kill 2           Kill session #2 from list
+""")
+
+
+def main():
+    pwd = os.getcwd()
+    args = sys.argv[1:]  # Pass through any arguments to claude
+
+    # Handle -- separator: args after -- are for claude, not for this wrapper
+    if "--" in args:
+        sep_idx = args.index("--")
+        wrapper_args = args[:sep_idx]
+        claude_args = args[sep_idx + 1:]  # Skip the -- itself
+    else:
+        wrapper_args = args
+        claude_args = args
+
+    # Check for --help flag
+    if wrapper_args and wrapper_args[0] in ("--help", "-h"):
+        print_help()
+        sys.exit(0)
+
+    # Check for --list flag
+    if wrapper_args and wrapper_args[0] == "--list":
+        sessions = get_sessions_for_workspace(pwd)
+        print_menu(sessions, pwd)
+        sys.exit(0)
+
+    # Check for --list-all flag
+    if wrapper_args and wrapper_args[0] == "--list-all":
+        sessions = get_all_sessions_list()
+        print("\n\033[1mAll Claude Code sessions:\033[0m\n")
+        if not sessions:
+            print("  \033[90mNo sessions found.\033[0m")
+        else:
+            # Group by path
+            by_path = {}
+            for i, s in enumerate(sessions, 1):
+                path = s["pwd"]
+                if path not in by_path:
+                    by_path[path] = []
+                by_path[path].append((i, s))
+
+            for path in sorted(by_path.keys()):
+                print(f"  \033[1;36m{path}\033[0m")
+                for i, s in by_path[path]:
+                    if s["attached"]:
+                        status = "\033[90m[IN USE]\033[0m"
+                    else:
+                        status = "\033[1;32m[AVAILABLE]\033[0m"
+                    print(f"    \033[1;32m{i})\033[0m {s['name']} {status}")
+                print()
+        sys.exit(0)
+
+    # Check for --connect flag
+    if wrapper_args and wrapper_args[0] == "--connect":
+        if len(wrapper_args) < 2:
+            print("\033[31mError: --connect requires a session number\033[0m")
+            print("Use --list-all to see available sessions")
+            sys.exit(1)
+        try:
+            idx = int(wrapper_args[1]) - 1
+            sessions = get_all_sessions_list()
+            if idx < 0 or idx >= len(sessions):
+                print(f"\033[31mError: Invalid session number {wrapper_args[1]}\033[0m")
+                print(f"Valid range: 1-{len(sessions)}")
+                sys.exit(1)
+            session = sessions[idx]
+            if session["attached"]:
+                print(f"\033[33mWarning: Session is already attached elsewhere\033[0m")
+            # Change to the session's working directory before attaching
+            session_pwd = session["pwd"]
+            if session_pwd != "unknown" and os.path.isdir(session_pwd):
+                os.chdir(session_pwd)
+            attach_session(session["name"])
+        except ValueError:
+            print(f"\033[31mError: '{wrapper_args[1]}' is not a valid number\033[0m")
+            sys.exit(1)
+
+
+    # Check for --kill flag
+    if wrapper_args and wrapper_args[0] == "--kill":
+        if len(wrapper_args) < 2:
+            print("\033[31mError: --kill requires a session number\033[0m")
+            print("Use --list-all to see available sessions")
+            sys.exit(1)
+        try:
+            idx = int(wrapper_args[1]) - 1
+            sessions = get_all_sessions_list()
+            if idx < 0 or idx >= len(sessions):
+                print(f"\033[31mError: Invalid session number {wrapper_args[1]}\033[0m")
+                print(f"Valid range: 1-{len(sessions)}")
+                sys.exit(1)
+            session = sessions[idx]
+            kill_session(session["name"])
+            print(f"\033[31mKilled {session['name']}\033[0m")
+            sys.exit(0)
+        except ValueError:
+            print(f"\033[31mError: '{wrapper_args[1]}' is not a valid number\033[0m")
+            sys.exit(1)
+
+    # Check for --kill-orphans flag
+    if wrapper_args and wrapper_args[0] == "--kill-orphans":
+        # Kill detached sessions not in current workspace
+        all_sessions = get_tmux_sessions()
+        killed = 0
+        for name, info in all_sessions.items():
+            if not info["attached"]:
+                kill_session(name)
+                print(f"Killed: {name}")
+                killed += 1
+        print(f"\nKilled {killed} orphaned sessions.")
+        sys.exit(0)
+    
+    interactive_menu(pwd, claude_args)
+
+
+if __name__ == "__main__":
+    main()
