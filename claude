@@ -143,8 +143,7 @@ def start_new_session(session_name: str, args: list):
     subprocess.run(["tmux", "set", "-g", "terminal-overrides", "xterm*:smcup@:rmcup@"])
     # Disable status bar for minimal interference
     subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
-    # Enable mouse for scrollback, set large history buffer
-    subprocess.run(["tmux", "set", "-t", session_name, "mouse", "on"])
+    # Large history buffer for scrollback (terminal handles mouse scrolling)
     subprocess.run(["tmux", "set", "-t", session_name, "history-limit", "50000"])
     # Attach
     os.execvp("tmux", ["tmux", "attach", "-t", session_name])
