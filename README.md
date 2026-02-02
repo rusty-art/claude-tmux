@@ -184,11 +184,11 @@ tmux set -t $session history-limit 50000  # Large scrollback buffer
 
 ### Scrolling Through History
 
-| Method | How |
-|--------|-----|
-| Mouse wheel | Just scroll (native terminal scrolling with tmux 3.6a+) |
-| `Ctrl+B [` | Enter copy mode, use arrows/PgUp/PgDn, `q` to exit |
-| `Ctrl+B PgUp` | Quick scroll up |
+| Method | How | Use for |
+|--------|-----|---------|
+| Mouse wheel | Just scroll | Recent output (current terminal session) |
+| `Ctrl+B [` | Enter copy mode, PgUp/PgDn to scroll, `q` to exit | Full tmux history (including before reattach) |
+| `Ctrl+B PgUp` | Quick scroll up | Shortcut to enter copy mode and scroll |
 
 ### Alternative Options to Try
 
@@ -213,12 +213,15 @@ tmux set -t $session escape-time 10
 After testing various configurations, we found:
 - **Large history**: Claude sessions can get long; 50k lines prevents losing context
 - **Status off**: Cleaner look, and session info is shown in the wrapper's menu instead
+- **Mouse off** (default): Keeps native terminal scrolling and text selection working perfectly
+
+**Important:** Don't set `mouse on` in your tmux config. With mouse mode enabled, tmux captures all mouse events which breaks native text selection. The tradeoff isn't worth it - use `Ctrl+B [` then PgUp/PgDn for older history instead.
 
 ### tmux Version Requirement
 
 **tmux 3.6a or later is required** for reliable mouse handling. With 3.6a+:
 - Native terminal scrolling works (Windows Terminal, VS Code terminal, etc.)
 - Text selection and copy/paste work normally
-- No need for tmux's copy mode for basic scrolling
+- Use `Ctrl+B [` + PgUp/PgDn to access history from before you attached
 
 Earlier tmux versions have issues where mouse events interfere with terminal scrolling and text selection.
