@@ -2,6 +2,8 @@
 """
 claude-wrapper: Smart tmux wrapper for Claude Code
 Manages persistent Claude Code sessions across VS Code disconnections.
+
+Requires: tmux 3.6a or later
 """
 
 import subprocess

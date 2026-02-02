@@ -48,9 +48,10 @@ Additionally, the wrapper:
 
 2. Ensure the real Claude Code is at `~/.local/bin/claude` (or edit `REAL_CLAUDE` in the script)
 
-3. Install tmux if not already installed:
+3. Install tmux 3.6a or later (required for reliable mouse scrolling and text selection):
    ```bash
    sudo apt install tmux
+   tmux -V  # Should show 3.6a or higher
    ```
 
 ## Usage
@@ -127,7 +128,7 @@ Since Claude Code runs inside tmux, some keyboard shortcuts require the tmux pre
 - **Ctrl+B** is tmux's prefix key. Press it, release, then press the next key.
 - **Ctrl+B Ctrl+B** sends a literal Ctrl+B through to Claude Code (for backgrounding tasks)
 - **Ctrl+C** and **Ctrl+D** work normally (interrupt/exit Claude)
-- Mouse scrolling is enabled for easy history navigation
+- Mouse scrolling and text selection work natively (with tmux 3.6a+)
 
 ## Session States
 
@@ -176,9 +177,8 @@ These flags are prepended when starting new sessions. Command-line flags (after 
 
 The wrapper configures each session with sensible defaults:
 
-```python
-tmux set -t $session status off        # Hide status bar (cleaner look)
-tmux set -t $session mouse on          # Enable mouse scrolling
+```bash
+tmux set -t $session status off           # Hide status bar (cleaner look)
 tmux set -t $session history-limit 50000  # Large scrollback buffer
 ```
 
@@ -186,7 +186,7 @@ tmux set -t $session history-limit 50000  # Large scrollback buffer
 
 | Method | How |
 |--------|-----|
-| Mouse wheel | Just scroll (mouse mode enabled) |
+| Mouse wheel | Just scroll (native terminal scrolling with tmux 3.6a+) |
 | `Ctrl+B [` | Enter copy mode, use arrows/PgUp/PgDn, `q` to exit |
 | `Ctrl+B PgUp` | Quick scroll up |
 
@@ -201,9 +201,6 @@ tmux set -t $session status on
 # Change scrollback size (default: 50000 lines)
 tmux set -t $session history-limit 100000
 
-# Disable mouse if it interferes with text selection
-tmux set -t $session mouse off
-
 # Use vi-style keys in copy mode
 tmux set -t $session mode-keys vi
 
@@ -214,6 +211,14 @@ tmux set -t $session escape-time 10
 ### Why These Defaults?
 
 After testing various configurations, we found:
-- **Mouse on**: Essential for easy scrolling through Claude's output
 - **Large history**: Claude sessions can get long; 50k lines prevents losing context
 - **Status off**: Cleaner look, and session info is shown in the wrapper's menu instead
+
+### tmux Version Requirement
+
+**tmux 3.6a or later is required** for reliable mouse handling. With 3.6a+:
+- Native terminal scrolling works (Windows Terminal, VS Code terminal, etc.)
+- Text selection and copy/paste work normally
+- No need for tmux's copy mode for basic scrolling
+
+Earlier tmux versions have issues where mouse events interfere with terminal scrolling and text selection.
