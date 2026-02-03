@@ -11,6 +11,7 @@ import os
 import sys
 import hashlib
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -126,7 +127,30 @@ def attach_session(session_name: str, show_detach_hint: bool = False):
     """Attach to an existing tmux session."""
     if show_detach_hint:
         print("\033[90mTip: Press Ctrl-b d to detach (leaves session running)\033[0m\n")
-    os.execvp("tmux", ["tmux", "attach", "-t", session_name])
+    # Ensure pane-died hook is set (may not exist for older sessions)
+    output_file = f"/tmp/claude-tmux-{session_name}.txt"
+    subprocess.run([
+        "tmux", "set-hook", "-t", session_name, "pane-died",
+        f'run-shell "capture-pane -p -S -30 > {output_file}"'
+    ], capture_output=True)
+    # Attach and track timing
+    start_time = time.time()
+    subprocess.run(["tmux", "attach", "-t", session_name])
+    elapsed = time.time() - start_time
+
+    # If session exited within 10 seconds, show captured output
+    if elapsed < 10 and os.path.exists(output_file):
+        try:
+            content = Path(output_file).read_text().strip()
+            if content:
+                print("\n\033[1;31m━━━ Session exited quickly. Last output: ━━━\033[0m\n")
+                print(content)
+                print("\n\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
+        except IOError:
+            pass
+    # Clean up temp file
+    if os.path.exists(output_file):
+        os.remove(output_file)
 
 
 def start_new_session(session_name: str, args: list):
@@ -147,8 +171,30 @@ def start_new_session(session_name: str, args: list):
     subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
     # Large history buffer for scrollback (terminal handles mouse scrolling)
     subprocess.run(["tmux", "set", "-t", session_name, "history-limit", "50000"])
-    # Attach
-    os.execvp("tmux", ["tmux", "attach", "-t", session_name])
+    # Capture last 30 lines to temp file when pane dies (for crash diagnostics)
+    output_file = f"/tmp/claude-tmux-{session_name}.txt"
+    subprocess.run([
+        "tmux", "set-hook", "-t", session_name, "pane-died",
+        f'run-shell "capture-pane -p -S -30 > {output_file}"'
+    ])
+    # Attach and track timing for quick-exit detection
+    start_time = time.time()
+    subprocess.run(["tmux", "attach", "-t", session_name])
+    elapsed = time.time() - start_time
+
+    # If session exited within 10 seconds, show captured output
+    if elapsed < 10 and os.path.exists(output_file):
+        try:
+            content = Path(output_file).read_text().strip()
+            if content:
+                print("\n\033[1;31m━━━ Session exited quickly. Last output: ━━━\033[0m\n")
+                print(content)
+                print("\n\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
+        except IOError:
+            pass
+    # Clean up temp file
+    if os.path.exists(output_file):
+        os.remove(output_file)
 
 
 def print_menu(sessions: list, pwd: str):
@@ -185,6 +231,8 @@ def print_options():
     print("\033[1mOptions:\033[0m")
     print("   \033[1m[1-9]\033[0m    Connect to detached session")
     print("   \033[1m[n]\033[0m      New session")
+    print("   \033[1m[a]\033[0m      Show all sessions (all workspaces)")
+    print("   \033[1m[h N]\033[0m    Show history for session N")
     print("   \033[1m[k N]\033[0m    Kill session N")
     print("   \033[1m[q]\033[0m      Quit")
     print()
@@ -286,6 +334,106 @@ def interactive_menu(pwd: str, args: list):
             except ValueError:
                 print("   \033[31mInvalid input\033[0m")
 
+        elif choice == 'a':
+            # Show all sessions menu
+            all_sessions = get_all_sessions_list()
+            print_all_sessions_menu(all_sessions)
+            print_all_sessions_options()
+
+            # Sub-loop for all-sessions menu
+            while True:
+                try:
+                    sub_choice = input("\033[1;32m(all)>\033[0m ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    sys.exit(0)
+
+                all_sessions = get_all_sessions_list()  # Refresh
+
+                if sub_choice == 'q':
+                    sys.exit(0)
+
+                elif sub_choice == 'b':
+                    # Back to workspace menu
+                    sessions = get_sessions_for_workspace(pwd)
+                    print_menu(sessions, pwd)
+                    print_options()
+                    break
+
+                elif sub_choice.startswith('h'):
+                    # History: h N or hN
+                    num_str = sub_choice[1:].strip()
+                    if num_str:
+                        try:
+                            idx = int(num_str) - 1
+                            if 0 <= idx < len(all_sessions):
+                                session = all_sessions[idx]
+                                print(f"\n\033[1;36m━━━ Last 30 lines: {session['name']} ━━━\033[0m\n")
+                                print(get_session_history(session["name"]))
+                                print(f"\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n")
+                            else:
+                                print(f"   \033[31mInvalid session number\033[0m")
+                        except ValueError:
+                            print("   \033[31mInvalid input\033[0m")
+                    else:
+                        print("   \033[31mUsage: h N (e.g., h3)\033[0m")
+
+                elif sub_choice.startswith('k ') or sub_choice.startswith('k'):
+                    # Kill: k N
+                    num_str = sub_choice[1:].strip() if sub_choice.startswith('k ') else sub_choice[1:].strip()
+                    if num_str:
+                        try:
+                            idx = int(num_str) - 1
+                            if 0 <= idx < len(all_sessions):
+                                session = all_sessions[idx]
+                                kill_session(session["name"])
+                                print(f"   \033[31mKilled {session['name']}\033[0m")
+                                all_sessions = get_all_sessions_list()
+                                print_all_sessions_menu(all_sessions)
+                                print_all_sessions_options()
+                            else:
+                                print(f"   \033[31mInvalid session number\033[0m")
+                        except ValueError:
+                            print("   \033[31mInvalid input\033[0m")
+                    else:
+                        print("   \033[31mUsage: k N (e.g., k3)\033[0m")
+
+                elif sub_choice.isdigit():
+                    idx = int(sub_choice) - 1
+                    if 0 <= idx < len(all_sessions):
+                        session = all_sessions[idx]
+                        if session["attached"]:
+                            print("   \033[33mWarning: Session is attached elsewhere\033[0m")
+                        # Change to session's directory before attaching
+                        session_pwd = session["pwd"]
+                        if session_pwd != "unknown" and os.path.isdir(session_pwd):
+                            os.chdir(session_pwd)
+                        attach_session(session["name"], show_detach_hint=True)
+                        return
+                    else:
+                        print("   \033[31mInvalid number\033[0m")
+
+                else:
+                    print("   \033[31mUnknown option\033[0m")
+
+        elif choice.startswith('h'):
+            # History: h N or hN
+            num_str = choice[1:].strip()
+            if num_str:
+                try:
+                    idx = int(num_str) - 1
+                    if 0 <= idx < len(all_ordered):
+                        session = all_ordered[idx]
+                        print(f"\n\033[1;36m━━━ Last 30 lines: {session['name']} ━━━\033[0m\n")
+                        print(get_session_history(session["name"]))
+                        print(f"\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n")
+                    else:
+                        print(f"   \033[31mInvalid session number\033[0m")
+                except ValueError:
+                    print("   \033[31mInvalid input\033[0m")
+            else:
+                print("   \033[31mUsage: h N (e.g., h3)\033[0m")
+
         elif choice.isdigit():
             idx = int(choice) - 1
             if 0 <= idx < len(detached):
@@ -295,24 +443,80 @@ def interactive_menu(pwd: str, args: list):
                 print("   \033[31mCan't connect - session is attached elsewhere\033[0m")
             else:
                 print("   \033[31mInvalid number\033[0m")
-        
+
         else:
             print("   \033[31mUnknown option\033[0m")
 
 
 def get_all_sessions_list() -> list:
-    """Get all sessions as a numbered list."""
+    """Get all sessions as a numbered list, sorted by pwd then name."""
     all_sessions = get_tmux_sessions()
     state = load_state()
     result = []
-    for name, info in sorted(all_sessions.items()):
+    for name, info in all_sessions.items():
         pwd_info = state.get("sessions", {}).get(name, {}).get("pwd", "unknown")
         result.append({
             "name": name,
             "attached": info["attached"],
             "pwd": pwd_info
         })
-    return result
+    # Sort by pwd first, then by name (matches display order in print_all_sessions_menu)
+    return sorted(result, key=lambda s: (s["pwd"], s["name"]))
+
+
+def get_session_history(session_name: str, lines: int = 30) -> str:
+    """Capture the last N lines of history from a tmux session."""
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode == 0:
+        return result.stdout
+    return f"Error capturing history: {result.stderr}"
+
+
+def print_all_sessions_menu(sessions: list):
+    """Print menu showing all sessions across all workspaces."""
+    print("\n\033[1;36m╔══════════════════════════════════════════════════════════════╗\033[0m")
+    print("\033[1;36m║\033[0m  \033[1mAll Claude Code Sessions\033[0m                                    \033[1;36m║\033[0m")
+    print("\033[1;36m╚══════════════════════════════════════════════════════════════╝\033[0m\n")
+
+    if not sessions:
+        print("  \033[90mNo sessions found.\033[0m\n")
+        return
+
+    # Group by path
+    by_path = {}
+    for s in sessions:
+        path = s["pwd"]
+        if path not in by_path:
+            by_path[path] = []
+        by_path[path].append(s)
+
+    # Number sequentially in display order
+    idx = 1
+    for path in sorted(by_path.keys()):
+        print(f"  \033[1;36m{path}\033[0m")
+        for s in by_path[path]:
+            if s["attached"]:
+                status = "\033[90m[IN USE]\033[0m"
+            else:
+                status = "\033[1;32m[AVAILABLE]\033[0m"
+            print(f"    \033[1;32m{idx})\033[0m {s['name']} {status}")
+            idx += 1
+        print()
+
+
+def print_all_sessions_options():
+    """Print options for all-sessions menu."""
+    print("\033[1mOptions:\033[0m")
+    print("   \033[1m[1-9]\033[0m    Connect to session (changes to its directory)")
+    print("   \033[1m[h N]\033[0m    Show history for session N")
+    print("   \033[1m[k N]\033[0m    Kill session N")
+    print("   \033[1m[b]\033[0m      Back to workspace menu")
+    print("   \033[1m[q]\033[0m      Quit")
+    print()
 
 
 def print_help():
@@ -449,7 +653,7 @@ def main():
                 killed += 1
         print(f"\nKilled {killed} orphaned sessions.")
         sys.exit(0)
-    
+
     interactive_menu(pwd, claude_args)
 
 
