@@ -161,12 +161,17 @@ def start_new_session(session_name: str, args: list):
     cmd = " ".join([REAL_CLAUDE] + all_args)
 
     # Create detached session with the command
+    # CI=true disables Ink's cursor repositioning, which breaks tmux scrollback
+    # (Ink uses CSI 7A to move cursor up and redraw in-place for spinners/progress)
+    # FORCE_COLOR=1 preserves colors that CI=true would otherwise disable
     subprocess.run([
-        "tmux", "new-session", "-d", "-s", session_name, cmd
+        "tmux", "new-session", "-d", "-s", session_name,
+        "-e", "CI=true", "-e", "FORCE_COLOR=1", cmd
     ], check=True)
 
-    # Disable smcup/rmcup so errors stay visible after tmux exits (no screen restore)
-    subprocess.run(["tmux", "set", "-g", "terminal-overrides", "xterm*:smcup@:rmcup@"])
+    # Disable smcup/rmcup to prevent alternate screen buffer issues
+    # Match both xterm* and tmux* terminal types
+    subprocess.run(["tmux", "set", "-g", "terminal-overrides", "*:smcup@:rmcup@"])
     # Disable status bar for minimal interference
     subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
     # Large history buffer for scrollback (terminal handles mouse scrolling)
