@@ -164,24 +164,42 @@ def start_new_session(session_name: str, args: list):
     # CI=true disables Ink's cursor repositioning, which breaks tmux scrollback
     # (Ink uses CSI 7A to move cursor up and redraw in-place for spinners/progress)
     # FORCE_COLOR=1 preserves colors that CI=true would otherwise disable
+
+    #### PROD: 
+    # subprocess.run([
+    #     "tmux", "new-session", "-d", "-s", session_name,
+    #     "-e", "CI=true", "-e", "FORCE_COLOR=1", cmd
+    # ], check=True)
+
+
+    #### TEST 1
     subprocess.run([
-        "tmux", "new-session", "-d", "-s", session_name,
-        "-e", "CI=true", "-e", "FORCE_COLOR=1", cmd
-    ], check=True)
+        "tmux", "new-session", "-d", "-s", session_name, cmd ], check=True)
 
     # Disable smcup/rmcup to prevent alternate screen buffer issues
     # Match both xterm* and tmux* terminal types
+
+    #### PROD
     subprocess.run(["tmux", "set", "-g", "terminal-overrides", "*:smcup@:rmcup@"])
+
+    #### PROD
     # Disable status bar for minimal interference
-    subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
-    # Large history buffer for scrollback (terminal handles mouse scrolling)
-    subprocess.run(["tmux", "set", "-t", session_name, "history-limit", "50000"])
+    # subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
+
+
+
+    #------------------------------------------------------------------
+    # support for showing last history buffer if it exists straight away 
+    #------------------------------------------------------------------
+
     # Capture last 30 lines to temp file when pane dies (for crash diagnostics)
     output_file = f"/tmp/claude-tmux-{session_name}.txt"
     subprocess.run([
         "tmux", "set-hook", "-t", session_name, "pane-died",
         f'run-shell "capture-pane -p -S -30 > {output_file}"'
     ])
+
+
     # Attach and track timing for quick-exit detection
     start_time = time.time()
     subprocess.run(["tmux", "attach", "-t", session_name])
@@ -200,6 +218,8 @@ def start_new_session(session_name: str, args: list):
     # Clean up temp file
     if os.path.exists(output_file):
         os.remove(output_file)
+
+# ---------------------------------------------------------------
 
 
 def print_menu(sessions: list, pwd: str):
@@ -658,6 +678,16 @@ def main():
                 killed += 1
         print(f"\nKilled {killed} orphaned sessions.")
         sys.exit(0)
+
+    # Already inside tmux? Run claude directly (no nesting).
+    # This handles the VS Code terminal profile case where tmux is the default
+    # shell (via "tmux new -ADs ${PWD##*/}" in settings.json). The outer tmux
+    # already provides crash protection, so we skip session management and exec.
+    if os.environ.get("TMUX"):
+        env_flags = os.environ.get("CLAUDE_TMUX_FLAGS", "").split()
+        all_args = env_flags + claude_args
+        print("\033[90mAlready in tmux — running claude directly.\033[0m")
+        os.execvp(REAL_CLAUDE, [REAL_CLAUDE] + all_args)
 
     interactive_menu(pwd, claude_args)
 
