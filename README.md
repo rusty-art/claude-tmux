@@ -128,7 +128,7 @@ Since Claude Code runs inside tmux, some keyboard shortcuts require the tmux pre
 - **Ctrl+B** is tmux's prefix key. Press it, release, then press the next key.
 - **Ctrl+B Ctrl+B** sends a literal Ctrl+B through to Claude Code (for backgrounding tasks)
 - **Ctrl+C** and **Ctrl+D** work normally (interrupt/exit Claude)
-- Mouse scrolling and text selection work natively (with tmux 3.6a+)
+- With `mouse on` in tmux.conf, mouse wheel scrolls through history and text selection works (tmux 3.6a+)
 
 ## Session States
 
@@ -173,54 +173,53 @@ export CLAUDE_TMUX_FLAGS="--dangerously-skip-permissions --verbose"
 
 These flags are prepended when starting new sessions. Command-line flags (after `--`) are appended after env flags.
 
-## Scrollback and tmux Options
+## VS Code Integration
 
-The wrapper configures each session with sensible defaults:
+If you use VS Code's integrated terminal, configure it to launch tmux automatically. Add to your VS Code `settings.json`:
+
+```json
+{
+    "terminal.integrated.profiles.linux": {
+        "tmux": {
+            "path": "bash",
+            "args": ["-c", "tmux new -ADs ${PWD##*/}"],
+            "icon": "terminal-tmux"
+        }
+    },
+    "terminal.integrated.defaultProfile.linux": "tmux",
+    "terminal.integrated.scrollback": 0,
+    "terminal.integrated.mouseWheelScrollSensitivity": 1
+}
+```
+
+What this does:
+- **`tmux new -ADs ${PWD##*/}`** — Creates or attaches to a tmux session named after the current folder. `-A` reuses existing sessions, `-D` detaches other clients, `-s` sets the session name.
+- **`scrollback: 0`** — Disables VS Code's own scroll buffer. With no buffer to scroll, mouse wheel events get forwarded to tmux instead. This lets tmux's `mouse on` handle scrolling (entering copy-mode on wheel-up, etc.).
+- **`mouseWheelScrollSensitivity: 1`** — Keeps mouse wheel speed normal for the terminal. These settings only affect terminal panels, not editor windows.
+
+The wrapper automatically detects when it's already running inside tmux (via the `$TMUX` environment variable) and runs Claude directly without creating a nested session. Management commands like `--list` and `--kill` still work.
+
+## tmux Configuration
+
+Add these to your `~/.tmux.conf`:
 
 ```bash
-tmux set -t $session status off           # Hide status bar (cleaner look)
-tmux set -t $session history-limit 50000  # Large scrollback buffer
+set -g history-limit 50000   # Large scrollback for long Claude sessions
+set -g mouse on              # Mouse wheel scrolls through tmux history
 ```
 
 ### Scrolling Through History
 
 | Method | How | Use for |
 |--------|-----|---------|
-| Mouse wheel | Just scroll | Recent output (current terminal session) |
+| Mouse wheel | Just scroll | Scrolls through tmux history (with `mouse on`) |
 | `Ctrl+B [` | Enter copy mode, PgUp/PgDn to scroll, `q` to exit | Full tmux history (including before reattach) |
 | `Ctrl+B PgUp` | Quick scroll up | Shortcut to enter copy mode and scroll |
-
-### Alternative Options to Try
-
-You can modify the `start_new_session()` function to experiment with other tmux settings:
-
-```bash
-# Show status bar with session info
-tmux set -t $session status on
-
-# Change scrollback size (default: 50000 lines)
-tmux set -t $session history-limit 100000
-
-# Use vi-style keys in copy mode
-tmux set -t $session mode-keys vi
-
-# Faster escape key response (useful if escape feels laggy)
-tmux set -t $session escape-time 10
-```
-
-### Why These Defaults?
-
-After testing various configurations, we found:
-- **Large history**: Claude sessions can get long; 50k lines prevents losing context
-- **Status off**: Cleaner look, and session info is shown in the wrapper's menu instead
-- **Mouse off** (default): Keeps native terminal scrolling and text selection working perfectly
-
-**Important:** Don't set `mouse on` in your tmux config. With mouse mode enabled, tmux captures all mouse events which breaks native text selection. The tradeoff isn't worth it - use `Ctrl+B [` then PgUp/PgDn for older history instead.
 
 ### tmux Version Requirement
 
 **tmux 3.6a or later is required** for reliable mouse handling. With 3.6a+:
-- Native terminal scrolling works (Windows Terminal, VS Code terminal, etc.)
+- Mouse scrolling enters tmux copy-mode automatically
 - Text selection and copy/paste work normally
 - Use `Ctrl+B [` + PgUp/PgDn to access history from before you attached
 
