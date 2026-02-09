@@ -127,6 +127,11 @@ def attach_session(session_name: str, show_detach_hint: bool = False):
     """Attach to an existing tmux session."""
     if show_detach_hint:
         print("\033[90mTip: Press Ctrl-b d to detach (leaves session running)\033[0m\n")
+    # Reload tmux config so any changes apply to this session
+    tmux_conf = Path.home() / ".tmux.conf"
+    if tmux_conf.exists():
+        subprocess.run(["tmux", "source-file", str(tmux_conf)], capture_output=True)
+
     # Ensure pane-died hook is set (may not exist for older sessions)
     output_file = f"/tmp/claude-tmux-{session_name}.txt"
     subprocess.run([
