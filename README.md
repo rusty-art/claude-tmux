@@ -201,26 +201,46 @@ The wrapper automatically detects when it's already running inside tmux (via the
 
 ## tmux Configuration
 
-Add these to your `~/.tmux.conf`:
+A complete `tmux.conf` is included in this repo. Copy it to your home directory:
 
 ```bash
-set -g history-limit 50000   # Large scrollback for long Claude sessions
-set -g mouse on              # Mouse wheel scrolls through tmux history
+cp tmux.conf ~/.tmux.conf
+tmux source-file ~/.tmux.conf   # reload if tmux is already running
+```
+
+### Copy/Paste Behavior (WSL2 + Windows Terminal)
+
+The included config provides near-native copy/paste that works seamlessly between tmux, WSL, and Windows:
+
+| Action | Behavior |
+|--------|----------|
+| **Click-drag** on live page | Select text, auto-copy to clipboard, return to normal |
+| **Click-drag** while scrolled up | Select text, auto-copy to clipboard, stay at scroll position |
+| **Left-click** while scrolled up | Clear selection, stay at scroll position |
+| **Right-click** anywhere | Paste from Windows clipboard |
+| **Double-click** | Select word + copy |
+| **Triple-click** | Select line + copy |
+| **`q`** while scrolled up | Exit scroll mode, return to live prompt |
+| **`Ctrl+B ]`** | Paste from clipboard (keyboard) |
+
+The smart copy-mode behavior uses a tmux pane option (`@fresh_copy`) as a flag to distinguish "selecting on the live page" from "selecting while browsing scrollback." On the live page, copy-mode enters and exits transparently. While scrolled up, it stays in copy-mode so you don't lose your position.
+
+### Requirements
+
+- **tmux 3.6a+** for reliable mouse handling
+- **xclip** for fast clipboard integration via WSLg (avoids slow `powershell.exe`/`clip.exe` calls)
+- **WSLg** (included in Windows 11 WSL2) provides the X11 bridge for xclip
+
+```bash
+sudo apt install tmux xclip
+tmux -V    # should show 3.6a or higher
 ```
 
 ### Scrolling Through History
 
-| Method | How | Use for |
-|--------|-----|---------|
-| Mouse wheel | Just scroll | Scrolls through tmux history (with `mouse on`) |
-| `Ctrl+B [` | Enter copy mode, PgUp/PgDn to scroll, `q` to exit | Full tmux history (including before reattach) |
-| `Ctrl+B PgUp` | Quick scroll up | Shortcut to enter copy mode and scroll |
-
-### tmux Version Requirement
-
-**tmux 3.6a or later is required** for reliable mouse handling. With 3.6a+:
-- Mouse scrolling enters tmux copy-mode automatically
-- Text selection and copy/paste work normally
-- Use `Ctrl+B [` + PgUp/PgDn to access history from before you attached
-
-Earlier tmux versions have issues where mouse events interfere with terminal scrolling and text selection.
+| Method | How |
+|--------|-----|
+| Mouse wheel | Scrolls through tmux history (enters copy-mode automatically) |
+| `Ctrl+B [` | Enter copy mode manually, PgUp/PgDn to scroll, `q` to exit |
+| `Ctrl+B PgUp` | Shortcut to enter copy mode and scroll up |
+| `q` | Exit copy mode (return to live prompt) |
