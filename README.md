@@ -1,6 +1,24 @@
 # claude-tmux
 
-A tmux wrapper for Claude Code that provides persistent sessions surviving terminal disconnections.
+A drop-in wrapper for Claude Code that:
+
+1. **Restores full 1M context to subagents.** TeamCreate / Agent spawns no longer get capped at 200K on Opus 4.7 1M-context accounts.
+2. **Keeps Claude running across terminal disconnects** via persistent tmux sessions — so you don't lose in-flight work when WSL, SSH, or VS Code drops.
+
+## Why use this wrapper?
+
+### 1M-context subagents on Opus 4.7
+
+Claude Code spawns every teammate with an explicit `--model <name>` on the command line. That argument resolves to the non-1M variant, so each subagent starts with only a **200K context window** — even when the parent is running on the 1M-context Opus 4.7 plan. Combined with the system prompt, tools, rules, skills, and CLAUDE.md files that subagents inherit, you can be **60%+ full before the agent does any actual work**.
+
+This wrapper sets `CLAUDE_CODE_TEAMMATE_COMMAND` on outer launch, which Claude Code's internal spawn resolver honours as the preferred teammate binary. Every subagent spawn then re-enters this wrapper, which strips the `--model <value>` pair from argv and execs the real `claude` binary. With no `--model` argument, Claude falls through to its default resolver, which automatically appends the `[1m]` suffix for eligible accounts — giving subagents the full **1M context window**.
+
+- No binary patching, no `.real` rename, no shim install in `~/.local/share/claude/versions/`.
+- Survives Claude Code auto-updates untouched — the wrapper is just a Python script you put on your `PATH` in front of the real binary.
+
+### Persistent sessions across disconnects
+
+See the [Problem](#problem) and [Solution](#solution) sections below for how the tmux wrapping keeps Claude running when your terminal drops.
 
 ## Problem
 
