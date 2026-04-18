@@ -19,6 +19,164 @@ from datetime import datetime
 REAL_CLAUDE = str(Path.home() / ".local/bin/claude")
 STATE_FILE = Path.home() / ".claude-sessions.json"
 SESSION_PREFIX = "cc"
+SELF_PATH = str(Path(__file__).resolve())
+
+# Fork repos that back locally-installed Claude Code plugins.
+# On outer launch we fetch upstream, merge into the tracking branch, and push
+# to origin so Claude's own periodic plugin "update" pulls the merged result.
+# Add more entries (e.g. gsd) when/if you want them auto-synced too.
+FORK_SYNC_REPOS = [
+    {
+        "name": "superpowers",
+        "path": Path.home() / "path/to/your/skills-and-mcp/superpowers",
+        "branch": "your-feature-branch",
+        "upstream_remote": "upstream",
+        "upstream_branch": "main",
+        "origin_remote": "origin",
+    },
+]
+
+def get_claude_tmux_flags() -> str:
+    """Get CLAUDE_TMUX_FLAGS, preferring tmux global env when inside tmux.
+
+    The tmux server caches its environment at startup. Shells inside tmux
+    inherit this stale snapshot. To work around this, outer invocations
+    sync the current value into tmux's global environment, and inner
+    invocations read it back from there.
+    """
+    if os.environ.get("TMUX"):
+        result = subprocess.run(
+            ["tmux", "show-environment", "-g", "CLAUDE_TMUX_FLAGS"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            line = result.stdout.strip()
+            if "=" in line:
+                return line.split("=", 1)[1]
+    return os.environ.get("CLAUDE_TMUX_FLAGS", "")
+
+
+def sync_tmux_flags_to_server():
+    """Push current CLAUDE_TMUX_FLAGS into tmux's global environment.
+
+    Called when running outside tmux so that future inside-tmux
+    invocations read the up-to-date value via get_claude_tmux_flags().
+    """
+    val = os.environ.get("CLAUDE_TMUX_FLAGS", "")
+    if val:
+        subprocess.run(
+            ["tmux", "set-environment", "-g", "CLAUDE_TMUX_FLAGS", val],
+            capture_output=True
+        )
+    else:
+        # Unset so stale values don't linger
+        subprocess.run(
+            ["tmux", "set-environment", "-g", "-u", "CLAUDE_TMUX_FLAGS"],
+            capture_output=True
+        )
+
+
+def _run_git(path, args, timeout=30):
+    """Run git subcommand in repo at `path`. Returns CompletedProcess or None on error."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(path)] + list(args),
+            capture_output=True, text=True, timeout=timeout
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+
+
+def sync_one_fork(cfg) -> str:
+    """Fetch upstream, merge into tracking branch, push to origin. Safe to skip on any problem.
+
+    Returns a one-line status string (already ANSI-coloured) for the caller to print.
+    """
+    name = cfg["name"]
+    path = cfg["path"]
+    branch = cfg["branch"]
+    upstream_ref = f"{cfg['upstream_remote']}/{cfg['upstream_branch']}"
+
+    if not path.exists() or not (path / ".git").exists():
+        return f"  \033[90m⤳ {name}: not a git repo at {path}, skipping\033[0m"
+
+    # Bail cleanly if there's anything uncommitted — don't interfere with user's work
+    status = _run_git(path, ["status", "--porcelain"])
+    if status is None or status.returncode != 0:
+        return f"  \033[31m⤳ {name}: git status failed, skipping\033[0m"
+    if status.stdout.strip():
+        return f"  \033[33m⤳ {name}: uncommitted changes, skipping\033[0m"
+
+    # Only sync when actually on the tracking branch
+    current = _run_git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if current is None or current.returncode != 0:
+        return f"  \033[31m⤳ {name}: cannot read current branch, skipping\033[0m"
+    current_branch = current.stdout.strip()
+    if current_branch != branch:
+        return f"  \033[33m⤳ {name}: on '{current_branch}' (expected '{branch}'), skipping\033[0m"
+
+    # Fetch upstream (may fail on network — don't block)
+    fetch = _run_git(path, ["fetch", cfg["upstream_remote"], "--quiet", "--prune"])
+    if fetch is None or fetch.returncode != 0:
+        return f"  \033[33m⤳ {name}: fetch upstream failed (offline?), skipping\033[0m"
+
+    behind = _run_git(path, ["rev-list", "--count", f"HEAD..{upstream_ref}"])
+    if behind is None or behind.returncode != 0:
+        return f"  \033[31m⤳ {name}: cannot compare with {upstream_ref}, skipping\033[0m"
+    behind_n = int(behind.stdout.strip() or "0")
+
+    if behind_n == 0:
+        return f"  \033[32m✓ {name}: up to date with {upstream_ref}\033[0m"
+
+    # Merge upstream — abort cleanly on conflict
+    merge = _run_git(path, ["merge", upstream_ref, "--no-edit", "--quiet"])
+    if merge is None or merge.returncode != 0:
+        _run_git(path, ["merge", "--abort"])
+        return f"  \033[31m⤳ {name}: merge conflict from {upstream_ref}, aborted — resolve manually\033[0m"
+
+    # Push to origin so Claude's plugin update pulls the merged result
+    push = _run_git(path, ["push", cfg["origin_remote"], branch, "--quiet"])
+    if push is None or push.returncode != 0:
+        return (f"  \033[33m⤳ {name}: merged {behind_n} commits locally but push to "
+                f"{cfg['origin_remote']} failed (network?)\033[0m")
+
+    return f"  \033[32m✓ {name}: merged {behind_n} upstream commits and pushed to {cfg['origin_remote']}/{branch}\033[0m"
+
+
+def sync_fork_repos():
+    """Sync all configured fork repos. Silent when FORK_SYNC_REPOS is empty or CLAUDE_SKIP_FORK_SYNC is set."""
+    if not FORK_SYNC_REPOS:
+        return
+    if os.environ.get("CLAUDE_SKIP_FORK_SYNC"):
+        return
+    print("\033[90m[claude-tmux] Checking plugin forks for upstream updates...\033[0m")
+    for cfg in FORK_SYNC_REPOS:
+        print(sync_one_fork(cfg))
+
+
+def _agent_fastpath(args):
+    """When invoked as a subagent (--agent-id in argv), skip tmux orchestration.
+
+    Claude Code's NeK() resolver reads CLAUDE_CODE_TEAMMATE_COMMAND FIRST to
+    choose the teammate spawn binary. On the outer launch we set that env var
+    to this wrapper's canonical path, so every subagent spawn re-enters this
+    script with `--agent-id …` in argv. We strip `--model <value>` (otherwise
+    the subagent caps at 200K instead of defaulting to the 1M variant), then
+    exec the real claude ELF via ~/.local/bin/claude.
+    """
+    if "--agent-id" not in args:
+        return
+    stripped = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--model":
+            skip_next = True
+            continue
+        stripped.append(a)
+    os.execv(REAL_CLAUDE, [REAL_CLAUDE] + stripped)
 
 
 def get_workspace_hash(pwd: str) -> str:
@@ -160,36 +318,28 @@ def attach_session(session_name: str, show_detach_hint: bool = False):
 
 def start_new_session(session_name: str, args: list):
     """Start a new tmux session with claude (dumb terminal mode)."""
-    # Prepend any flags from CLAUDE_TMUX_FLAGS environment variable
-    env_flags = os.environ.get("CLAUDE_TMUX_FLAGS", "").split()
+    # Prepend any flags from CLAUDE_TMUX_FLAGS (reads tmux global env if inside tmux)
+    env_flags = get_claude_tmux_flags().split()
     all_args = env_flags + args
     cmd = " ".join([REAL_CLAUDE] + all_args)
+    cmd = f"echo '[claude-tmux] {cmd}'; {cmd}"
 
     # Create detached session with the command
-    # CI=true disables Ink's cursor repositioning, which breaks tmux scrollback
-    # (Ink uses CSI 7A to move cursor up and redraw in-place for spinners/progress)
-    # FORCE_COLOR=1 preserves colors that CI=true would otherwise disable
+    # Claude Code 2.1+ handles scrollback correctly via its own scroll-region
+    # rendering (input pinned to bottom, output scrolls cleanly), so CI=true
+    # is no longer needed and was actively harmful: it suppressed Claude
+    # Code's mouse reporting, which broke the native (blue) selection
+    # highlight inside tmux. FORCE_COLOR=1 is kept as a harmless belt-and-braces.
 
-    #### PROD: 
-    # subprocess.run([
-    #     "tmux", "new-session", "-d", "-s", session_name,
-    #     "-e", "CI=true", "-e", "FORCE_COLOR=1", cmd
-    # ], check=True)
-
-
-    #### TEST 1
     subprocess.run([
-        "tmux", "new-session", "-d", "-s", session_name, cmd ], check=True)
+        "tmux", "new-session", "-d", "-s", session_name,
+        "-e", "FORCE_COLOR=1",
+        "-e", f"CLAUDE_CODE_TEAMMATE_COMMAND={SELF_PATH}",
+        cmd
+    ], check=True)
 
     # Disable smcup/rmcup to prevent alternate screen buffer issues
-    # Match both xterm* and tmux* terminal types
-
-    #### PROD
     subprocess.run(["tmux", "set", "-g", "terminal-overrides", "*:smcup@:rmcup@"])
-
-    #### PROD
-    # Disable status bar for minimal interference
-    # subprocess.run(["tmux", "set", "-t", session_name, "status", "off"])
 
 
 
@@ -564,6 +714,10 @@ def print_help():
     --attach N        Attach to session N from --list-all
     --kill N          Kill session N from --list-all
     --kill-orphans    Kill all detached sessions
+    --sync-forks      Fetch upstream + merge + push for configured plugin forks
+
+\033[1mENV:\033[0m
+    CLAUDE_SKIP_FORK_SYNC=1   Skip the automatic fork sync on outer launch
 
 \033[1mEXAMPLES:\033[0m
     claude                    Interactive menu for current workspace
@@ -571,12 +725,30 @@ def print_help():
     claude --attach 2         Attach to session #2 from list
     claude -- --resume        Start claude with --resume flag
     claude --kill 2           Kill session #2 from list
+    claude --sync-forks       Sync plugin forks with upstream right now
 """)
 
 
 def main():
     pwd = os.getcwd()
     args = sys.argv[1:]  # Pass through any arguments to claude
+
+    # Subagent fast-path: re-entered via CLAUDE_CODE_TEAMMATE_COMMAND. Strip
+    # --model and exec the real claude so the subagent gets 1M context.
+    _agent_fastpath(args)
+
+    # Outer launches: force subagent spawns back through this wrapper so the
+    # --model strip happens. Inherited into child claude's env.
+    os.environ["CLAUDE_CODE_TEAMMATE_COMMAND"] = SELF_PATH
+
+    # Sync CLAUDE_TMUX_FLAGS into tmux's global environment so that
+    # inside-tmux invocations don't get a stale cached value
+    if not os.environ.get("TMUX"):
+        sync_tmux_flags_to_server()
+        # Sync locally-installed plugin forks against their upstreams once
+        # per outer launch. Skipped automatically when already inside tmux or
+        # when CLAUDE_SKIP_FORK_SYNC is set.
+        sync_fork_repos()
 
     # Handle -- separator: args after -- are for claude, not for this wrapper
     if "--" in args:
@@ -590,6 +762,11 @@ def main():
     # Check for --help flag
     if wrapper_args and wrapper_args[0] in ("--help", "-h"):
         print_help()
+        sys.exit(0)
+
+    # Check for --sync-forks flag: manual one-shot sync of configured plugin forks
+    if wrapper_args and wrapper_args[0] == "--sync-forks":
+        sync_fork_repos()
         sys.exit(0)
 
     # Check for --list flag
@@ -689,9 +866,10 @@ def main():
     # shell (via "tmux new -ADs ${PWD##*/}" in settings.json). The outer tmux
     # already provides crash protection, so we skip session management and exec.
     if os.environ.get("TMUX"):
-        env_flags = os.environ.get("CLAUDE_TMUX_FLAGS", "").split()
+        env_flags = get_claude_tmux_flags().split()
         all_args = env_flags + claude_args
         print("\033[90mAlready in tmux — running claude directly.\033[0m")
+        print(str([REAL_CLAUDE] + all_args))
         os.execvp(REAL_CLAUDE, [REAL_CLAUDE] + all_args)
 
     interactive_menu(pwd, claude_args)
