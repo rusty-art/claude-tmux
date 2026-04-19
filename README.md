@@ -262,3 +262,73 @@ tmux -V    # should show 3.6a or higher
 | `Ctrl+B [` | Enter copy mode manually, PgUp/PgDn to scroll, `q` to exit |
 | `Ctrl+B PgUp` | Shortcut to enter copy mode and scroll up |
 | `q` | Exit copy mode (return to live prompt) |
+
+## tmux-bridge statusline hook
+
+`hooks/tmux-bridge-statusline.js` is a Claude Code `PostToolUse` hook that writes model, context, and token-cost metrics into the tmux pane's status line after every tool call. Works independently of any GSD install — originated as a fork of GSD's `gsd-statusline.js` but is now self-contained.
+
+### What it shows
+
+A single line in `status-format[1]` of the outer tmux pane, e.g.:
+
+```
+cc-1234  opus-4.7 1M  ctx 32%  $0.42/2.10  +12%cache
+```
+
+| Field | Meaning |
+|-------|---------|
+| `cc-NNNN` | Short session id |
+| Model | Resolved `display_name`; `1M` suffix shown when `[1m]` variant is active |
+| `ctx N%` | Context used — uses a per-model `MODEL_CONTEXTS` map so 200K and 1M models both read correctly |
+| `$in/out` | Running USD cost for this session |
+| `+N%cache` | Prompt-cache hit rate |
+
+### Install
+
+```bash
+# One-time: deploy the hook to Claude Code's hooks dir
+install -Dm0755 hooks/tmux-bridge-statusline.js ~/.claude/hooks/tmux-bridge-statusline.js
+```
+
+Register it in `~/.claude/settings.json` under `hooks.PostToolUse`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/hooks/tmux-bridge-statusline.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Customising context sizes
+
+The `MODEL_CONTEXTS` map in the hook is the only place context totals are defined. Edit it to add a new model or adjust a window:
+
+```js
+const MODEL_CONTEXTS = {
+  'claude-opus-4-6':   1000000,
+  'claude-opus-4-5':    200000,
+  'claude-sonnet-4-6':  200000,
+  'claude-sonnet-4-5':  200000,
+  'claude-haiku-4-5':   200000,
+};
+```
+
+Unknown models fall back to 200K. The `[1m]` suffix always forces 1M regardless of base model.
+
+### Requirements
+
+- `tmux 3.x+` with `mouse on` already configured (covered by the bundled `tmux.conf`)
+- `node` on `PATH` (any LTS works)
+- `~/.claude/settings.json` writable
