@@ -34,6 +34,16 @@ FORK_SYNC_REPOS = [
         "upstream_branch": "main",
         "origin_remote": "origin",
     },
+    {
+        # Jnuyens-based plugin fork — this is what the your-marketplace
+        # marketplace actually installs. Upstream master is jnuyens/gsd-plugin.
+        "name": "gsd-plugin",
+        "path": Path.home() / "path/to/your/skills-and-mcp/gsd-plugin",
+        "branch": "your-feature-branch",
+        "upstream_remote": "upstream",
+        "upstream_branch": "master",
+        "origin_remote": "origin",
+    },
 ]
 
 def get_claude_tmux_flags() -> str:
@@ -715,15 +725,20 @@ def print_help():
     --kill N          Kill session N from --list-all
     --kill-orphans    Kill all detached sessions
     --sync-forks      Fetch upstream + merge + push for configured plugin forks
+    --compact[=N]     Set CLAUDE_CODE_AUTO_COMPACT_WINDOW (default 400000 tokens
+                      reserved as buffer — triggers auto-compact at 600K used of
+                      a 1M window). Pass --compact=200000 etc. to override.
 
 \033[1mENV:\033[0m
     CLAUDE_SKIP_FORK_SYNC=1   Skip the automatic fork sync on outer launch
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=N   Tokens to reserve for auto-compact buffer
 
 \033[1mEXAMPLES:\033[0m
     claude                    Interactive menu for current workspace
     claude --list-all         Show all sessions with numbers
     claude --attach 2         Attach to session #2 from list
     claude -- --resume        Start claude with --resume flag
+    claude --compact -- --resume   Restart with aggressive auto-compact at 600K
     claude --kill 2           Kill session #2 from list
     claude --sync-forks       Sync plugin forks with upstream right now
 """)
@@ -758,6 +773,19 @@ def main():
     else:
         wrapper_args = args
         claude_args = args
+
+    # --compact[=N]: set CLAUDE_CODE_AUTO_COMPACT_WINDOW. Strip from wrapper_args
+    # so it doesn't collide with other flag handlers. Does nothing if the env var
+    # is already set (user override wins).
+    compact_remaining = []
+    for a in wrapper_args:
+        if a == "--compact" or a.startswith("--compact="):
+            value = a.split("=", 1)[1] if "=" in a else "400000"
+            if not os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = value
+            continue
+        compact_remaining.append(a)
+    wrapper_args = compact_remaining
 
     # Check for --help flag
     if wrapper_args and wrapper_args[0] in ("--help", "-h"):
