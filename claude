@@ -765,6 +765,20 @@ def main():
         # when CLAUDE_SKIP_FORK_SYNC is set.
         sync_fork_repos()
 
+    # --compact[=N]: set CLAUDE_CODE_AUTO_COMPACT_WINDOW. Strip from the raw
+    # args BEFORE the -- split so it never reaches the real claude binary
+    # (it's a wrapper-only flag). Does nothing if the env var is already set
+    # (user override wins).
+    compact_filtered = []
+    for a in args:
+        if a == "--compact" or a.startswith("--compact="):
+            value = a.split("=", 1)[1] if "=" in a else "400000"
+            if not os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
+                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = value
+            continue
+        compact_filtered.append(a)
+    args = compact_filtered
+
     # Handle -- separator: args after -- are for claude, not for this wrapper
     if "--" in args:
         sep_idx = args.index("--")
@@ -773,19 +787,6 @@ def main():
     else:
         wrapper_args = args
         claude_args = args
-
-    # --compact[=N]: set CLAUDE_CODE_AUTO_COMPACT_WINDOW. Strip from wrapper_args
-    # so it doesn't collide with other flag handlers. Does nothing if the env var
-    # is already set (user override wins).
-    compact_remaining = []
-    for a in wrapper_args:
-        if a == "--compact" or a.startswith("--compact="):
-            value = a.split("=", 1)[1] if "=" in a else "400000"
-            if not os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
-                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = value
-            continue
-        compact_remaining.append(a)
-    wrapper_args = compact_remaining
 
     # Check for --help flag
     if wrapper_args and wrapper_args[0] in ("--help", "-h"):
