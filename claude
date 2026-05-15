@@ -62,42 +62,41 @@ PER_ACCOUNT_DIRS = [
     "telemetry",                  # per-account telemetry buffers
 ]
 
-# Fork repos that back locally-installed Claude Code plugins.
-# On outer launch we fetch upstream, merge into the tracking branch, and push
-# to origin so Claude's own periodic plugin "update" pulls the merged result.
-# Add more entries (e.g. gsd) when/if you want them auto-synced too.
-FORK_SYNC_REPOS = [
-    {
-        "name": "superpowers",
-        "path": Path.home() / "path/to/your/skills-and-mcp/superpowers",
-        "branch": "your-feature-branch",
-        "upstream_remote": "upstream",
-        "upstream_branch": "main",
-        "origin_remote": "origin",
-    },
-    {
-        # Jnuyens-based plugin fork — this is what the your-marketplace
-        # marketplace actually installs. Upstream master is jnuyens/gsd-plugin.
-        "name": "gsd-plugin",
-        "path": Path.home() / "path/to/your/skills-and-mcp/gsd-plugin",
-        "branch": "your-feature-branch",
-        "upstream_remote": "upstream",
-        "upstream_branch": "master",
-        "origin_remote": "origin",
-    },
-]
+# Fork and skill repo sync config lives in forks.json next to this script.
+# - fork_sync_repos: forks of Claude Code plugins. On outer launch we fetch
+#   upstream, merge into the tracking branch, and push to origin so Claude's
+#   own periodic plugin "update" pulls the merged result.
+# - skill_sync_repos: upstream-only skill repos — cloned locally and
+#   symlinked into ~/.claude/skills/. We don't fork these; just
+#   `git pull --ff-only` to keep symlinked skills current.
+# Missing/malformed forks.json => both lists empty => sync becomes a no-op.
+# See forks.example.json for the schema.
+def _load_forks_config() -> tuple[list[dict], list[dict]]:
+    conf = Path(SELF_PATH).parent / "forks.json"
+    if not conf.exists():
+        return [], []
+    try:
+        data = json.loads(conf.read_text())
+    except json.JSONDecodeError as e:
+        print(f"\033[33m[claude-tmux] forks.json malformed: {e}; "
+              f"fork/skill sync disabled\033[0m", file=sys.stderr)
+        return [], []
 
-# Upstream-only skill repos — cloned locally and symlinked into ~/.claude/skills/.
-# We don't fork these; just `git pull --ff-only` to keep symlinked skills current.
-# Add an entry when symlink-installing another upstream skill repo.
-SKILL_SYNC_REPOS = [
-    {
-        "name": "emil-design",
-        "path": Path.home() / "path/to/your/skills-and-mcp/emil-design",
-        "branch": "main",
-        "remote": "origin",
-    },
-]
+    def _expand(items):
+        out = []
+        for item in items:
+            entry = dict(item)
+            entry["path"] = Path(os.path.expanduser(item["path"]))
+            out.append(entry)
+        return out
+
+    return (
+        _expand(data.get("fork_sync_repos", [])),
+        _expand(data.get("skill_sync_repos", [])),
+    )
+
+
+FORK_SYNC_REPOS, SKILL_SYNC_REPOS = _load_forks_config()
 
 def get_claude_tmux_flags() -> str:
     """Get CLAUDE_TMUX_FLAGS, preferring tmux global env when inside tmux.

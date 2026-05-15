@@ -6,6 +6,10 @@ __pycache__
 accounts.json
 .this_claude
 
+# Fork-sync config (see forks.example.json for the schema). Holds local repo
+# paths and branch names that don't generalize across users.
+forks.json
+
 # GSD per-task scratch dir (.planning/PHASE.md, REVIEW.md, etc.) — task-scoped,
 # not versioned with the wrapper.
 .planning/

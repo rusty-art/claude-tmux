@@ -1,0 +1,28 @@
+{
+  "fork_sync_repos": [
+    {
+      "name": "superpowers",
+      "path": "~/path/to/your/superpowers-fork",
+      "branch": "your-feature-branch",
+      "upstream_remote": "upstream",
+      "upstream_branch": "main",
+      "origin_remote": "origin"
+    },
+    {
+      "name": "gsd-plugin",
+      "path": "~/path/to/your/gsd-plugin-fork",
+      "branch": "your-feature-branch",
+      "upstream_remote": "upstream",
+      "upstream_branch": "master",
+      "origin_remote": "origin"
+    }
+  ],
+  "skill_sync_repos": [
+    {
+      "name": "emil-design",
+      "path": "~/path/to/your/emil-design-clone",
+      "branch": "main",
+      "remote": "origin"
+    }
+  ]
+}
