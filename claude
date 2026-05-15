@@ -11,6 +11,7 @@ import os
 import sys
 import hashlib
 import json
+import shutil
 import time
 from pathlib import Path
 from datetime import datetime
@@ -20,6 +21,46 @@ REAL_CLAUDE = str(Path.home() / ".local/bin/claude")
 STATE_FILE = Path.home() / ".claude-sessions.json"
 SESSION_PREFIX = "cc"
 SELF_PATH = str(Path(__file__).resolve())
+
+# Multi-account config. accounts.json lives next to this script.
+# .this_claude is a one-word marker recording which account is active.
+ACCOUNTS_CONF = Path(SELF_PATH).parent / "accounts.json"
+ACTIVE_MARKER = Path(SELF_PATH).parent / ".this_claude"
+CLAUDE_DIR = Path.home() / ".claude"
+
+# Per-account slice: these paths inside ~/.claude/ are symlinks to
+# ~/.claude-<active-account>/<item>. Everything else in ~/.claude/ stays as
+# real shared files visible to both accounts. Keep this list tight — every
+# entry here means "this genuinely needs to differ per identity".
+PER_ACCOUNT_FILES = [
+    ".credentials.json",          # OAuth tokens for the Claude login itself
+    "mcp-needs-auth-cache.json",  # tracks which MCPs this account still needs to auth
+    "cost-tracker.log",           # per-account cost accounting (user preference)
+]
+# Ephemeral / continuously-rewritten files that LOSE the symlink race against
+# Claude Code's atomic-rename writes. Treating these as symlinks is futile:
+# every few minutes Claude rewrites them via write-temp + rename(temp, path),
+# which destroys the symlink and leaves a real file containing stale data
+# from whichever account wrote last (often the wrong account if any prior
+# session is still in memory). Strategy: on --setup, delete these from BOTH
+# ~/.claude/ AND HOME so the new account starts fresh and Claude regenerates
+# them with correct identity. Accept brief intra-session inaccuracy as the
+# tradeoff. Paths can be absolute or relative — relative resolves under HOME.
+EPHEMERAL_RESET_ON_SWITCH = [
+    Path.home() / ".claude" / "stats-cache.json",  # usage stats — clobbered every few min
+    Path.home() / ".claude.json",                   # 62 KB blob in HOME with cached client/usage data
+]
+PER_ACCOUNT_DIRS = [
+    "statsig",                    # feature flags + telemetry keyed by user ID
+    "sessions",                   # live session index — keeps resume UI per-account
+    "session-env",                # follows sessions/
+    "session-data",               # follows sessions/
+    "ide",                        # VS Code extension pairing tokens
+    "mcp-configs",                # MCP OAuth refresh tokens (account-scoped)
+    "homunculus",                 # live background-agent state
+    "metrics",                    # per-account metrics
+    "telemetry",                  # per-account telemetry buffers
+]
 
 # Fork repos that back locally-installed Claude Code plugins.
 # On outer launch we fetch upstream, merge into the tracking branch, and push
@@ -43,6 +84,18 @@ FORK_SYNC_REPOS = [
         "upstream_remote": "upstream",
         "upstream_branch": "master",
         "origin_remote": "origin",
+    },
+]
+
+# Upstream-only skill repos — cloned locally and symlinked into ~/.claude/skills/.
+# We don't fork these; just `git pull --ff-only` to keep symlinked skills current.
+# Add an entry when symlink-installing another upstream skill repo.
+SKILL_SYNC_REPOS = [
+    {
+        "name": "emil-design",
+        "path": Path.home() / "path/to/your/skills-and-mcp/emil-design",
+        "branch": "main",
+        "remote": "origin",
     },
 ]
 
@@ -162,6 +215,415 @@ def sync_fork_repos():
     print("\033[90m[claude-tmux] Checking plugin forks for upstream updates...\033[0m")
     for cfg in FORK_SYNC_REPOS:
         print(sync_one_fork(cfg))
+
+
+def sync_one_skill(cfg) -> str:
+    """Fetch and fast-forward an upstream-only skill repo. Safe to skip on any problem.
+
+    Returns a one-line ANSI-coloured status string for the caller to print.
+    """
+    name = cfg["name"]
+    path = cfg["path"]
+    branch = cfg["branch"]
+    remote = cfg["remote"]
+    remote_ref = f"{remote}/{branch}"
+
+    if not path.exists() or not (path / ".git").exists():
+        return f"  \033[90m⤳ {name}: not a git repo at {path}, skipping\033[0m"
+
+    # Bail cleanly if there's anything uncommitted — never touch user's work
+    status = _run_git(path, ["status", "--porcelain"])
+    if status is None or status.returncode != 0:
+        return f"  \033[31m⤳ {name}: git status failed, skipping\033[0m"
+    if status.stdout.strip():
+        return f"  \033[33m⤳ {name}: uncommitted changes, skipping\033[0m"
+
+    # Only sync when on the expected branch
+    current = _run_git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+    if current is None or current.returncode != 0:
+        return f"  \033[31m⤳ {name}: cannot read current branch, skipping\033[0m"
+    current_branch = current.stdout.strip()
+    if current_branch != branch:
+        return f"  \033[33m⤳ {name}: on '{current_branch}' (expected '{branch}'), skipping\033[0m"
+
+    # Fetch (may fail offline — non-fatal)
+    fetch = _run_git(path, ["fetch", remote, "--quiet", "--prune"])
+    if fetch is None or fetch.returncode != 0:
+        return f"  \033[33m⤳ {name}: fetch {remote} failed (offline?), skipping\033[0m"
+
+    behind = _run_git(path, ["rev-list", "--count", f"HEAD..{remote_ref}"])
+    if behind is None or behind.returncode != 0:
+        return f"  \033[31m⤳ {name}: cannot compare with {remote_ref}, skipping\033[0m"
+    behind_n = int(behind.stdout.strip() or "0")
+
+    if behind_n == 0:
+        return f"  \033[32m✓ {name}: up to date with {remote_ref}\033[0m"
+
+    # Fast-forward only — refuse if local has diverged (preserves any local commits)
+    merge = _run_git(path, ["merge", "--ff-only", remote_ref, "--quiet"])
+    if merge is None or merge.returncode != 0:
+        return f"  \033[33m⤳ {name}: cannot fast-forward from {remote_ref} (local diverged?), skipping\033[0m"
+
+    return f"  \033[32m✓ {name}: pulled {behind_n} commits from {remote_ref}\033[0m"
+
+
+def sync_skill_repos():
+    """Sync all configured skill repos. Silent when SKILL_SYNC_REPOS is empty or CLAUDE_SKIP_SKILL_SYNC is set."""
+    if not SKILL_SYNC_REPOS:
+        return
+    if os.environ.get("CLAUDE_SKIP_SKILL_SYNC"):
+        return
+    print("\033[90m[claude-tmux] Checking symlinked skill repos for upstream updates...\033[0m")
+    for cfg in SKILL_SYNC_REPOS:
+        print(sync_one_skill(cfg))
+
+
+# The ECC plugin's fact-forcing gate (gateguard-fact-force) fires on every
+# routine Bash invocation and every first-Edit-per-file, demanding Claude
+# quote the user's instruction verbatim. We hate it. We disable it two ways:
+#   1. ECC_DISABLED_HOOKS in ~/.claude/settings.json lists both variant IDs
+#      (pre:edit-write:gateguard-fact-force and pre:bash:gateguard-fact-force)
+#      — the official env-var kill-switch.
+#   2. This helper overwrites the backing script with a no-op stub on every
+#      outer launch, so the gate stays dead even after a plugin update pulls
+#      a fresh copy of the upstream script. Also removes the gateguard skill
+#      directory so it stops appearing in the skill listing.
+# The stub still exports { run } and still reads/writes stdin cleanly so that
+# bash-hook-dispatcher.js (which require()s it) keeps working.
+GATEGUARD_STUB = b"""#!/usr/bin/env node
+// Neutralized by ./claude wrapper (claude-tmux). Original gate was the
+// fact-forcing PreToolUse check; we don't want it. Re-applied on every
+// outer launch by neutralize_gateguard() in """ + str(SELF_PATH).encode() + b""".
+'use strict';
+const run = rawInput => rawInput;
+module.exports = { run };
+if (require.main === module) {
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', c => { buf += c; });
+  process.stdin.on('end', () => { process.stdout.write(buf); process.exit(0); });
+}
+"""
+
+
+def _ecc_cache_root() -> Path | None:
+    """Return the newest ECC plugin version directory, or None if not installed."""
+    base = CLAUDE_DIR / "plugins" / "cache" / "everything-claude-code" / "everything-claude-code"
+    if not base.is_dir():
+        return None
+    versions = [p for p in base.iterdir() if p.is_dir()]
+    if not versions:
+        return None
+    # Sort by name — semver-ish dirs like '1.10.0' sort correctly lexically
+    # for ECC's numbering, and if they diverge we still pick a deterministic one.
+    return sorted(versions, key=lambda p: p.name)[-1]
+
+
+def neutralize_gateguard():
+    """Overwrite the ECC gate script with a no-op stub and remove its skill dir.
+
+    Idempotent, runs on every outer launch. Silent when CLAUDE_SKIP_GATEGUARD_NEUTRALIZE
+    is set or ECC isn't installed. Never aborts launch on error — this is belt-and-braces.
+    """
+    if os.environ.get("CLAUDE_SKIP_GATEGUARD_NEUTRALIZE"):
+        return
+    root = _ecc_cache_root()
+    if root is None:
+        return
+
+    script = root / "scripts" / "hooks" / "gateguard-fact-force.js"
+    skill_dir = root / "skills" / "gateguard"
+
+    # 1. Stub the backing script (only rewrite if content differs, to avoid
+    #    noisy inotify events and keep mtimes stable for ECC's own cache logic)
+    if script.parent.is_dir():
+        try:
+            current = script.read_bytes() if script.exists() else b""
+        except OSError:
+            current = b""
+        if current != GATEGUARD_STUB:
+            try:
+                script.write_bytes(GATEGUARD_STUB)
+                print(f"  \033[32m✓ gateguard script stubbed ({script.relative_to(CLAUDE_DIR)})\033[0m")
+            except OSError as e:
+                print(f"  \033[33m⤳ could not stub gateguard: {e}\033[0m")
+
+    # 2. Remove the skill directory so the skill stops appearing in listings
+    if skill_dir.is_dir():
+        try:
+            import shutil
+            shutil.rmtree(skill_dir)
+            print(f"  \033[32m✓ gateguard skill dir removed\033[0m")
+        except OSError as e:
+            print(f"  \033[33m⤳ could not remove gateguard skill dir: {e}\033[0m")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-account support
+#
+# ~/.claude/ stays a real directory with all shared state (plugins, skills,
+# projects/, CLAUDE.md, etc.). Only the items in PER_ACCOUNT_FILES / _DIRS are
+# symlinks out to ~/.claude-<active>/<item>. Switching accounts is just a
+# matter of repointing those ~10 symlinks and updating the .this_claude marker.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_accounts_config() -> dict:
+    """Read accounts.json next to this script. Fail loudly if missing/malformed."""
+    if not ACCOUNTS_CONF.exists():
+        print(f"\033[31m[claude-tmux] Missing {ACCOUNTS_CONF}. "
+              f"Create it to use multi-account mode.\033[0m", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(ACCOUNTS_CONF.read_text())
+    except json.JSONDecodeError as e:
+        print(f"\033[31m[claude-tmux] Malformed {ACCOUNTS_CONF}: {e}\033[0m",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def account_dir(cfg: dict, name: str) -> Path:
+    """Resolve an account's dir (expanding ~)."""
+    return Path(os.path.expanduser(cfg["accounts"][name]["dir"]))
+
+
+def get_active_account(cfg: dict) -> str:
+    """Read active account from .this_claude, falling back to cfg['default']."""
+    if ACTIVE_MARKER.exists():
+        name = ACTIVE_MARKER.read_text().strip()
+        if name in cfg["accounts"]:
+            return name
+    return cfg["default"]
+
+
+def _pre_create_slots(adir: Path):
+    """Create the account dir plus the per-account directory slots inside it.
+    Files are left absent — Claude writes them on first use."""
+    adir.mkdir(parents=True, exist_ok=True)
+    for d in PER_ACCOUNT_DIRS:
+        (adir / d).mkdir(exist_ok=True)
+
+
+def _atomic_copy(src: Path, dst: Path):
+    """Copy src → dst atomically (write-to-temp + rename in dst's dir).
+    shutil.copy2 preserves mode AND mtime — both matter: mode for credential
+    perms (0o600), mtime for the newer-wins comparison in _sync_file_to_account
+    (without preserved mtime, every copy would re-trigger itself next launch)."""
+    tmp = dst.parent / (dst.name + ".tmp")
+    shutil.copy2(src, tmp)
+    tmp.replace(dst)
+
+
+def _sync_file_to_account(item: str, adir: Path):
+    """Snapshot the live ~/.claude/<item> back into the account dir.
+
+    PER_ACCOUNT_FILES are NOT symlinked. Claude Code rewrites them via
+    write-temp + rename(temp, path), which destroys symlinks and leaves a
+    real file at ~/.claude/<item> (see EPHEMERAL_RESET_ON_SWITCH for the same
+    observation about even more frequently-rewritten files). Maintaining the
+    symlink invariant is futile; instead we treat ~/.claude/<item> as the
+    live working copy and snapshot it back to the account dir on every launch.
+
+    Newer-wins. If ~/.claude/<item> is a stale symlink from an older wrapper
+    version, strip it and restore from the snap."""
+    live = CLAUDE_DIR / item
+    snap = adir / item
+
+    if live.is_symlink():
+        # Legacy: previous wrapper symlinked files. Snap is canonical; convert.
+        live.unlink()
+        if snap.exists():
+            _atomic_copy(snap, live)
+        return
+
+    if not live.exists():
+        # Just after a switch, or user removed it. Restore from snap if any.
+        if snap.exists():
+            _atomic_copy(snap, live)
+        return
+
+    # Live exists as a real file. Snap back if it's newer (or snap is missing).
+    if not snap.exists() or live.stat().st_mtime > snap.stat().st_mtime:
+        _atomic_copy(live, snap)
+
+
+def ensure_account_state(cfg: dict, name: str):
+    """Reconcile per-account state on every ./claude launch. Idempotent.
+
+    Two strategies, one per kind of slot:
+
+    - PER_ACCOUNT_DIRS: symlinks ~/.claude/<dir> → ~/.claude-<name>/<dir>.
+      Claude Code creates individual files inside these dirs but never
+      atomic-renames the dir itself, so the symlink survives.
+
+    - PER_ACCOUNT_FILES: NOT symlinked. ~/.claude/<f> is the live working
+      copy; this function snapshots it back to the account dir (newer-wins).
+      See _sync_file_to_account for the rationale.
+
+    Raises RuntimeError if a dir slot has a real non-empty directory
+    conflicting with the account-side — that means a migration was bypassed,
+    and --setup handles it."""
+    adir = account_dir(cfg, name)
+    if not adir.exists():
+        raise RuntimeError(
+            f"Account dir {adir} does not exist. Run './claude --setup {name}' first."
+        )
+    _pre_create_slots(adir)
+
+    # Files: snapshot live → account (newer-wins). No symlinks.
+    for item in PER_ACCOUNT_FILES:
+        _sync_file_to_account(item, adir)
+
+    # Dirs: maintain symlinks. Auto-heal only when account-side is empty.
+    for item in PER_ACCOUNT_DIRS:
+        target = adir / item
+        link = CLAUDE_DIR / item
+        expected = str(target)
+
+        if link.is_symlink() and os.readlink(link) == expected:
+            continue
+
+        if link.exists() and not link.is_symlink():
+            # Real dir at the symlink path. Auto-heal only if account-side is
+            # empty/missing; otherwise refuse to guess which copy is canonical.
+            target_safe = (
+                not target.exists()
+                or (target.is_dir() and not any(target.iterdir()))
+            )
+            if not target_safe:
+                raise RuntimeError(
+                    f"{link} is a real dir AND {target} also has content. "
+                    f"Resolve manually: keep one, delete the other, then re-run."
+                )
+            if target.exists() and target.is_dir():
+                target.rmdir()
+            link.rename(target)
+
+        if link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+
+
+def setup_account(cfg: dict, name: str):
+    """Activate `name`. On first use for this account, creates its dir.
+    On first run ever (pre-migration), moves real files from ~/.claude/ into
+    the active account's slot — that's the one-shot migration path.
+    Does NOT launch claude — the caller exits after this."""
+    if name not in cfg["accounts"]:
+        print(f"\033[31mError: unknown account '{name}'. "
+              f"Available: {', '.join(cfg['accounts'])}\033[0m", file=sys.stderr)
+        sys.exit(1)
+
+    adir = account_dir(cfg, name)
+    first_time = not adir.exists()
+    _pre_create_slots(adir)
+
+    # Identify outgoing account so we can preserve its live state before
+    # loading the new account's snapshot. None on first-ever migration or
+    # when re-running --setup with the currently-active account.
+    outgoing = get_active_account(cfg) if ACTIVE_MARKER.exists() else None
+    outgoing_adir = account_dir(cfg, outgoing) if outgoing and outgoing != name else None
+    if outgoing_adir and not outgoing_adir.exists():
+        outgoing_adir = None
+    if outgoing_adir:
+        _pre_create_slots(outgoing_adir)
+
+    migrated = []
+
+    # Files: save outgoing live state, then load incoming snapshot. No symlinks.
+    for item in PER_ACCOUNT_FILES:
+        live = CLAUDE_DIR / item
+        new_snap = adir / item
+
+        if live.is_symlink():
+            # Legacy: older wrapper symlinked files. Snap target already
+            # holds the canonical state for the outgoing account; just strip.
+            live.unlink()
+        elif live.exists():
+            if outgoing_adir is not None:
+                _atomic_copy(live, outgoing_adir / item)
+                migrated.append(f"{item} → saved to {outgoing}")
+            else:
+                # First-ever migration: live IS the initial snapshot for `name`.
+                _atomic_copy(live, new_snap)
+                migrated.append(f"{item} → migrated to {name}")
+            live.unlink()
+
+        if new_snap.exists():
+            _atomic_copy(new_snap, live)
+        # else: leave live absent — Claude regenerates on next launch.
+
+    # Dirs: existing symlink swap. Real dir at symlink path = pre-migration
+    # state; migrate into THIS account.
+    for item in PER_ACCOUNT_DIRS:
+        target = adir / item
+        link = CLAUDE_DIR / item
+
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            if target.exists():
+                if target.is_dir() and not any(target.iterdir()):
+                    target.rmdir()
+                else:
+                    print(f"\033[31mError: both {link} and {target} exist with "
+                          f"content. Resolve manually.\033[0m", file=sys.stderr)
+                    sys.exit(1)
+            link.rename(target)
+            migrated.append(item)
+
+        link.symlink_to(target)
+
+    # Ephemeral files: delete (don't symlink) so the new account starts fresh.
+    # See EPHEMERAL_RESET_ON_SWITCH comment for why symlinks lose this race.
+    reset = []
+    for p in EPHEMERAL_RESET_ON_SWITCH:
+        if p.is_symlink() or p.exists():
+            try:
+                p.unlink()
+                reset.append(str(p))
+            except OSError as e:
+                print(f"\033[33m[warn] could not reset {p}: {e}\033[0m",
+                      file=sys.stderr)
+
+    ACTIVE_MARKER.write_text(name + "\n")
+    email = cfg["accounts"][name].get("email", "")
+
+    print(f"\n\033[1;32m✓ Active account switched to: {name}\033[0m "
+          f"\033[90m({email})\033[0m")
+    print(f"  Config dir:    {adir}")
+    print(f"  Active marker: {ACTIVE_MARKER}")
+
+    if migrated:
+        print(f"\n\033[90m[migrated to {name}]\033[0m")
+        for m in migrated:
+            print(f"  \033[90m→ {m}\033[0m")
+
+    if reset:
+        print(f"\n\033[90m[ephemeral reset — Claude will regenerate]\033[0m")
+        for r in reset:
+            print(f"  \033[90m✗ {r}\033[0m")
+
+    if first_time:
+        print(f"\n\033[1;33mFirst-time setup for {name}.\033[0m")
+
+    creds = adir / ".credentials.json"
+    if not creds.exists():
+        print(f"\n\033[1;33mNext step:\033[0m run \033[1m./claude\033[0m "
+              f"to launch. Claude will prompt you to log in as "
+              f"\033[1m{email}\033[0m.")
+    else:
+        print(f"\n\033[90mCredentials present. Run ./claude to start a session.\033[0m")
+
+
+def print_setup_usage(cfg: dict):
+    """Print available accounts + usage for bare `./claude --setup`."""
+    print("\n\033[1mAvailable accounts:\033[0m")
+    active_now = get_active_account(cfg)
+    for aname, ainfo in cfg["accounts"].items():
+        marker = " \033[1;32m(active)\033[0m" if aname == active_now else ""
+        email = ainfo.get("email", "")
+        print(f"  \033[1m{aname}\033[0m: {email}{marker}")
+    print("\n\033[90mUsage: ./claude --setup <account>\033[0m\n")
 
 
 def _agent_fastpath(args):
@@ -331,7 +793,13 @@ def start_new_session(session_name: str, args: list):
     # Prepend any flags from CLAUDE_TMUX_FLAGS (reads tmux global env if inside tmux)
     env_flags = get_claude_tmux_flags().split()
     all_args = env_flags + args
-    cmd = " ".join([REAL_CLAUDE] + all_args)
+    # Inline env prefix: scopes vars to this single claude process (not tmux-wide).
+    # Subagents inherit them via os.execv in _agent_fastpath.
+    env_prefix = ""
+    pct_val = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+    if pct_val:
+        env_prefix = f"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE={pct_val} "
+    cmd = env_prefix + " ".join([REAL_CLAUDE] + all_args)
     cmd = f"echo '[claude-tmux] {cmd}'; {cmd}"
 
     # Create detached session with the command
@@ -719,28 +1187,48 @@ def print_help():
 
 \033[1mOPTIONS:\033[0m
     -h, --help        Show this help message
+    --setup [NAME]    Switch active Claude account (no arg: list accounts).
+                      Names come from accounts.json next to this script.
+                      Does NOT launch claude — run ./claude afterwards to start.
+                      First time for an account: creates its per-account dir
+                      slice; prompts for OAuth login when you next launch.
     --list            List sessions for current workspace
     --list-all        List all sessions across all workspaces
     --attach N        Attach to session N from --list-all
     --kill N          Kill session N from --list-all
     --kill-orphans    Kill all detached sessions
     --sync-forks      Fetch upstream + merge + push for configured plugin forks
-    --compact[=N]     Set CLAUDE_CODE_AUTO_COMPACT_WINDOW (default 400000 tokens
-                      reserved as buffer — triggers auto-compact at 600K used of
-                      a 1M window). Pass --compact=200000 etc. to override.
+    --sync-skills     Fast-forward pull for configured upstream-only skill repos
+                      (symlinked into ~/.claude/skills/)
+    --compact[=PCT]   Set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE — the % of the model's
+                      context window at which auto-compact fires. ON BY DEFAULT
+                      at 60 (compact at ~60% used = ~600K of a 1M window). Range
+                      1-95; values >95 are silently ignored by Claude Code
+                      (built-in cap). Pass --compact=75 etc. to override the
+                      default percentage. Bare --compact is now redundant but
+                      still accepted. NOTE: this is NOT
+                      CLAUDE_CODE_AUTO_COMPACT_WINDOW — that var *shrinks* the
+                      window for compaction math and made compact fire much
+                      earlier than intended.
+    --no-compact      Disable the default auto-compact for this launch (skip
+                      setting CLAUDE_AUTOCOMPACT_PCT_OVERRIDE so Claude Code's
+                      own built-in threshold applies).
 
 \033[1mENV:\033[0m
-    CLAUDE_SKIP_FORK_SYNC=1   Skip the automatic fork sync on outer launch
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW=N   Tokens to reserve for auto-compact buffer
+    CLAUDE_SKIP_FORK_SYNC=1            Skip the automatic fork sync on outer launch
+    CLAUDE_SKIP_SKILL_SYNC=1           Skip the automatic skill-repo sync on outer launch
+    CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=N  Auto-compact threshold as % of context window (1-95)
 
 \033[1mEXAMPLES:\033[0m
     claude                    Interactive menu for current workspace
     claude --list-all         Show all sessions with numbers
     claude --attach 2         Attach to session #2 from list
-    claude -- --resume        Start claude with --resume flag
-    claude --compact -- --resume   Restart with aggressive auto-compact at 600K
+    claude -- --resume        Start claude with --resume flag (auto-compact on @60%)
+    claude --compact=80 -- --resume   Override auto-compact to 80% (~800K of 1M)
+    claude --no-compact -- --resume   Disable wrapper's auto-compact override
     claude --kill 2           Kill session #2 from list
     claude --sync-forks       Sync plugin forks with upstream right now
+    claude --sync-skills      Pull upstream-only skill repos right now
 """)
 
 
@@ -756,6 +1244,30 @@ def main():
     # --model strip happens. Inherited into child claude's env.
     os.environ["CLAUDE_CODE_TEAMMATE_COMMAND"] = SELF_PATH
 
+    # Multi-account routing.
+    #   --setup <name>      Switch active account (migrates on first run). Exits.
+    #   --setup (no arg)    List accounts.
+    #   otherwise           Assert the active slice's symlinks are correct, then
+    #                       continue the normal launch flow.
+    accounts_cfg = load_accounts_config()
+    if args and args[0] == "--setup":
+        if len(args) < 2:
+            print_setup_usage(accounts_cfg)
+            sys.exit(0)
+        setup_account(accounts_cfg, args[1])
+        sys.exit(0)
+
+    active = get_active_account(accounts_cfg)
+    try:
+        ensure_account_state(accounts_cfg, active)
+    except RuntimeError as e:
+        print(f"\033[31m[claude-tmux] {e}\033[0m", file=sys.stderr)
+        sys.exit(1)
+    # Banner on outer launches only (keeps inside-tmux re-entries quiet).
+    if not os.environ.get("TMUX"):
+        email = accounts_cfg["accounts"][active].get("email", "")
+        print(f"\033[90m[claude-tmux] Active account: {active} ({email})\033[0m")
+
     # Sync CLAUDE_TMUX_FLAGS into tmux's global environment so that
     # inside-tmux invocations don't get a stale cached value
     if not os.environ.get("TMUX"):
@@ -764,20 +1276,47 @@ def main():
         # per outer launch. Skipped automatically when already inside tmux or
         # when CLAUDE_SKIP_FORK_SYNC is set.
         sync_fork_repos()
+        # Same idea for upstream-only skill repos (symlinked into ~/.claude/skills).
+        # Skipped when CLAUDE_SKIP_SKILL_SYNC is set.
+        sync_skill_repos()
+        # Neutralize ECC's fact-forcing gate on every outer launch so it
+        # survives plugin updates. Silent when ECC isn't installed.
+        neutralize_gateguard()
 
-    # --compact[=N]: set CLAUDE_CODE_AUTO_COMPACT_WINDOW. Strip from the raw
-    # args BEFORE the -- split so it never reaches the real claude binary
-    # (it's a wrapper-only flag). Does nothing if the env var is already set
-    # (user override wins).
+    # Auto-compact is ON by default — we set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60
+    # (compact at ~60% used = ~600K of a 1M window) unless:
+    #   - user passed --no-compact (opt out entirely for this launch)
+    #   - user passed --compact=PCT (explicit value, 1-95)
+    #   - env var is already set (user shell override wins)
+    # Bare --compact is still accepted as a redundant-but-harmless no-op for
+    # any scripts that already pass it.
+    # Strip these wrapper-only flags from args BEFORE the -- split so they
+    # never reach the real claude binary.
+    # Note: CLAUDE_CODE_AUTO_COMPACT_WINDOW is a SEPARATE knob that *shrinks*
+    # the capacity used in compaction math — using it as a "buffer reserve"
+    # backfires (e.g. 400000 on 1M caps the usable window at 400K, then PCT
+    # default ~95% fires compact at ~38% of the real window).
     compact_filtered = []
+    compact_value = "60"
+    disable_compact = False
     for a in args:
+        if a == "--no-compact":
+            disable_compact = True
+            continue
         if a == "--compact" or a.startswith("--compact="):
-            value = a.split("=", 1)[1] if "=" in a else "400000"
-            if not os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"):
-                os.environ["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = value
+            if "=" in a:
+                compact_value = a.split("=", 1)[1]
             continue
         compact_filtered.append(a)
     args = compact_filtered
+
+    # 2026-05-14: disabled — CLAUDE_AUTOCOMPACT_PCT_OVERRIDE behaviour is broken
+    # upstream (interactions with AUTO_COMPACT_WINDOW caused premature firing).
+    # Parser above still strips --compact / --no-compact so callers don't break,
+    # but we no longer set the env var. Re-enable here when the upstream knob
+    # is fixed, or remove the parser block too if we don't plan to come back.
+    # if not disable_compact and not os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"):
+    #     os.environ["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = compact_value
 
     # Handle -- separator: args after -- are for claude, not for this wrapper
     if "--" in args:
@@ -796,6 +1335,11 @@ def main():
     # Check for --sync-forks flag: manual one-shot sync of configured plugin forks
     if wrapper_args and wrapper_args[0] == "--sync-forks":
         sync_fork_repos()
+        sys.exit(0)
+
+    # Check for --sync-skills flag: manual one-shot sync of upstream-only skill repos
+    if wrapper_args and wrapper_args[0] == "--sync-skills":
+        sync_skill_repos()
         sys.exit(0)
 
     # Check for --list flag
