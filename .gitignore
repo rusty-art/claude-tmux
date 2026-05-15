@@ -1,1 +1,11 @@
 __pycache__
+
+# Multi-account runtime state (see claude --setup):
+#   accounts.json  — user-specific account map (emails, dirs); sensitive
+#   .this_claude   — active-account marker, flips on every --setup
+accounts.json
+.this_claude
+
+# GSD per-task scratch dir (.planning/PHASE.md, REVIEW.md, etc.) — task-scoped,
+# not versioned with the wrapper.
+.planning/
