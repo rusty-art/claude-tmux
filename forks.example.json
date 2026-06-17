@@ -24,5 +24,11 @@
       "branch": "main",
       "remote": "origin"
     }
+  ],
+  "_comment_gateguard_marketplaces": "Optional. Marketplace slugs to scan when neutralizing ECC's gateguard-fact-force gate. Omit to use the built-in defaults (ecc, everything-claude-code). Add your own slug here if your ECC marketplace is installed under a different name.",
+  "gateguard_marketplaces": [
+    "ecc",
+    "everything-claude-code",
+    "your-private-marketplace-slug"
   ]
 }

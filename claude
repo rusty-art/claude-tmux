@@ -62,6 +62,12 @@ PER_ACCOUNT_DIRS = [
     "telemetry",                  # per-account telemetry buffers
 ]
 
+# Default marketplace slugs whose gateguard-fact-force gate we neutralize.
+# Covers the public ECC marketplace under both its current ("ecc") and legacy
+# ("everything-claude-code") names. Users whose marketplace is installed under
+# a different (e.g. privately-named) slug add it via forks.json — see below.
+DEFAULT_GATEGUARD_MARKETPLACES = ["ecc", "everything-claude-code"]
+
 # Fork and skill repo sync config lives in forks.json next to this script.
 # - fork_sync_repos: forks of Claude Code plugins. On outer launch we fetch
 #   upstream, merge into the tracking branch, and push to origin so Claude's
@@ -69,18 +75,23 @@ PER_ACCOUNT_DIRS = [
 # - skill_sync_repos: upstream-only skill repos — cloned locally and
 #   symlinked into ~/.claude/skills/. We don't fork these; just
 #   `git pull --ff-only` to keep symlinked skills current.
-# Missing/malformed forks.json => both lists empty => sync becomes a no-op.
+# - gateguard_marketplaces: optional list of marketplace slugs to scan when
+#   neutralizing the gateguard gate. Overrides DEFAULT_GATEGUARD_MARKETPLACES
+#   when present; lets users name their own (e.g. private) marketplace without
+#   hardcoding it in this shared, public script.
+# Missing/malformed forks.json => sync lists empty, marketplaces fall back to
+# the defaults => sync becomes a no-op, gateguard still neutralized.
 # See forks.example.json for the schema.
-def _load_forks_config() -> tuple[list[dict], list[dict]]:
+def _load_forks_config() -> tuple[list[dict], list[dict], list[str]]:
     conf = Path(SELF_PATH).parent / "forks.json"
     if not conf.exists():
-        return [], []
+        return [], [], list(DEFAULT_GATEGUARD_MARKETPLACES)
     try:
         data = json.loads(conf.read_text())
     except json.JSONDecodeError as e:
         print(f"\033[33m[claude-tmux] forks.json malformed: {e}; "
               f"fork/skill sync disabled\033[0m", file=sys.stderr)
-        return [], []
+        return [], [], list(DEFAULT_GATEGUARD_MARKETPLACES)
 
     def _expand(items):
         out = []
@@ -90,13 +101,15 @@ def _load_forks_config() -> tuple[list[dict], list[dict]]:
             out.append(entry)
         return out
 
+    marketplaces = data.get("gateguard_marketplaces") or DEFAULT_GATEGUARD_MARKETPLACES
     return (
         _expand(data.get("fork_sync_repos", [])),
         _expand(data.get("skill_sync_repos", [])),
+        list(marketplaces),
     )
 
 
-FORK_SYNC_REPOS, SKILL_SYNC_REPOS = _load_forks_config()
+FORK_SYNC_REPOS, SKILL_SYNC_REPOS, GATEGUARD_MARKETPLACES = _load_forks_config()
 
 def get_claude_tmux_flags() -> str:
     """Get CLAUDE_TMUX_FLAGS, preferring tmux global env when inside tmux.
@@ -149,8 +162,34 @@ def _run_git(path, args, timeout=30):
         return None
 
 
+def _push_pending_commits(cfg, path, branch, ok_msg) -> str:
+    """Push local commits that origin lacks. Returns a status line.
+
+    Covers commits that reached the branch by a path other than this
+    auto-sync's own merge — e.g. a manual conflict resolution. Without this,
+    such commits sit unpushed forever and the deploy silently stalls. Fetches
+    origin first so the ahead-count is accurate; network errors are non-fatal
+    (falls back to ok_msg)."""
+    name = cfg["name"]
+    _run_git(path, ["fetch", cfg["origin_remote"], "--quiet", "--prune"])
+    origin_ref = f"{cfg['origin_remote']}/{branch}"
+    ahead = _run_git(path, ["rev-list", "--count", f"{origin_ref}..HEAD"])
+    if ahead is None or ahead.returncode != 0:
+        return ok_msg  # no origin branch yet / can't compare — leave as-is
+    ahead_n = int(ahead.stdout.strip() or "0")
+    if ahead_n == 0:
+        return ok_msg
+    push = _run_git(path, ["push", cfg["origin_remote"], branch, "--quiet"])
+    if push is None or push.returncode != 0:
+        return (f"  \033[33m⤳ {name}: {ahead_n} local commit(s) unpushed; "
+                f"push to {cfg['origin_remote']} failed (network?)\033[0m")
+    return (f"  \033[32m✓ {name}: pushed {ahead_n} pending local commit(s) "
+            f"to {cfg['origin_remote']}/{branch}\033[0m")
+
+
 def sync_one_fork(cfg) -> str:
-    """Fetch upstream, merge into tracking branch, push to origin. Safe to skip on any problem.
+    """Fetch upstream, merge into tracking branch, push to origin (including any
+    already-merged-but-unpushed commits). Safe to skip on any problem.
 
     Returns a one-line status string (already ANSI-coloured) for the caller to print.
     """
@@ -188,7 +227,12 @@ def sync_one_fork(cfg) -> str:
     behind_n = int(behind.stdout.strip() or "0")
 
     if behind_n == 0:
-        return f"  \033[32m✓ {name}: up to date with {upstream_ref}\033[0m"
+        # Up to date with upstream — but local may still hold unpushed commits
+        # (e.g. a manual conflict resolution this auto-sync didn't perform).
+        # Push them so the deploy doesn't silently stall.
+        return _push_pending_commits(
+            cfg, path, branch,
+            f"  \033[32m✓ {name}: up to date with {upstream_ref}\033[0m")
 
     # Merge upstream — abort cleanly on conflict
     merge = _run_git(path, ["merge", upstream_ref, "--no-edit", "--quiet"])
@@ -305,17 +349,40 @@ if (require.main === module) {
 """
 
 
-def _ecc_cache_root() -> Path | None:
-    """Return the newest ECC plugin version directory, or None if not installed."""
-    base = CLAUDE_DIR / "plugins" / "cache" / "everything-claude-code" / "everything-claude-code"
-    if not base.is_dir():
-        return None
-    versions = [p for p in base.iterdir() if p.is_dir()]
-    if not versions:
-        return None
-    # Sort by name — semver-ish dirs like '1.10.0' sort correctly lexically
-    # for ECC's numbering, and if they diverge we still pick a deterministic one.
-    return sorted(versions, key=lambda p: p.name)[-1]
+def _ecc_plugin_roots() -> list:
+    """Every installed ECC plugin root that contains the gate script.
+
+    ECC renamed itself 'everything-claude-code' → 'ecc' (2026-06), and installs
+    in two forms: direct (plugins/marketplaces/<slug>) and cached
+    (plugins/cache/<slug>/.../<version>). Slugs come from GATEGUARD_MARKETPLACES
+    (forks.json override, else DEFAULT_GATEGUARD_MARKETPLACES). Returns ALL roots
+    that actually hold scripts/hooks/gateguard-fact-force.js so
+    neutralize_gateguard stubs it wherever it might execute."""
+    rel = Path("scripts") / "hooks" / "gateguard-fact-force.js"
+    plugins = CLAUDE_DIR / "plugins"
+    candidates = []
+    for slug in GATEGUARD_MARKETPLACES:
+        candidates.append(plugins / "marketplaces" / slug)
+        candidates.append(plugins / slug)
+    # Cached installs nest one or two dirs deep under cache/<slug>/.
+    for slug in GATEGUARD_MARKETPLACES:
+        base = plugins / "cache" / slug
+        if not base.is_dir():
+            continue
+        try:
+            for lvl1 in (p for p in base.iterdir() if p.is_dir()):
+                candidates.append(lvl1)
+                candidates.extend(p for p in lvl1.iterdir() if p.is_dir())
+        except OSError:
+            pass
+    roots, seen = [], set()
+    for root in candidates:
+        if root in seen:
+            continue
+        seen.add(root)
+        if (root / rel).is_file():
+            roots.append(root)
+    return roots
 
 
 def neutralize_gateguard():
@@ -326,35 +393,36 @@ def neutralize_gateguard():
     """
     if os.environ.get("CLAUDE_SKIP_GATEGUARD_NEUTRALIZE"):
         return
-    root = _ecc_cache_root()
-    if root is None:
+    roots = _ecc_plugin_roots()
+    if not roots:
         return
 
-    script = root / "scripts" / "hooks" / "gateguard-fact-force.js"
-    skill_dir = root / "skills" / "gateguard"
+    import shutil
+    for root in roots:
+        script = root / "scripts" / "hooks" / "gateguard-fact-force.js"
+        skill_dir = root / "skills" / "gateguard"
 
-    # 1. Stub the backing script (only rewrite if content differs, to avoid
-    #    noisy inotify events and keep mtimes stable for ECC's own cache logic)
-    if script.parent.is_dir():
-        try:
-            current = script.read_bytes() if script.exists() else b""
-        except OSError:
-            current = b""
-        if current != GATEGUARD_STUB:
+        # 1. Stub the backing script (only rewrite if content differs, to avoid
+        #    noisy inotify events and keep mtimes stable for ECC's own cache logic)
+        if script.parent.is_dir():
             try:
-                script.write_bytes(GATEGUARD_STUB)
-                print(f"  \033[32m✓ gateguard script stubbed ({script.relative_to(CLAUDE_DIR)})\033[0m")
-            except OSError as e:
-                print(f"  \033[33m⤳ could not stub gateguard: {e}\033[0m")
+                current = script.read_bytes() if script.exists() else b""
+            except OSError:
+                current = b""
+            if current != GATEGUARD_STUB:
+                try:
+                    script.write_bytes(GATEGUARD_STUB)
+                    print(f"  \033[32m✓ gateguard script stubbed ({script.relative_to(CLAUDE_DIR)})\033[0m")
+                except OSError as e:
+                    print(f"  \033[33m⤳ could not stub gateguard: {e}\033[0m")
 
-    # 2. Remove the skill directory so the skill stops appearing in listings
-    if skill_dir.is_dir():
-        try:
-            import shutil
-            shutil.rmtree(skill_dir)
-            print(f"  \033[32m✓ gateguard skill dir removed\033[0m")
-        except OSError as e:
-            print(f"  \033[33m⤳ could not remove gateguard skill dir: {e}\033[0m")
+        # 2. Remove the skill directory so the skill stops appearing in listings
+        if skill_dir.is_dir():
+            try:
+                shutil.rmtree(skill_dir)
+                print(f"  \033[32m✓ gateguard skill dir removed ({skill_dir.relative_to(CLAUDE_DIR)})\033[0m")
+            except OSError as e:
+                print(f"  \033[33m⤳ could not remove gateguard skill dir: {e}\033[0m")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -808,12 +876,14 @@ def start_new_session(session_name: str, args: list):
     # Code's mouse reporting, which broke the native (blue) selection
     # highlight inside tmux. FORCE_COLOR=1 is kept as a harmless belt-and-braces.
 
-    subprocess.run([
+    new_session = [
         "tmux", "new-session", "-d", "-s", session_name,
         "-e", "FORCE_COLOR=1",
-        "-e", f"CLAUDE_CODE_TEAMMATE_COMMAND={SELF_PATH}",
-        cmd
-    ], check=True)
+    ]
+    # Teammate interception is opt-in; see the matching gate in main().
+    if os.environ.get("CLAUDE_TMUX_INTERCEPT_TEAMMATES"):
+        new_session += ["-e", f"CLAUDE_CODE_TEAMMATE_COMMAND={SELF_PATH}"]
+    subprocess.run(new_session + [cmd], check=True)
 
     # Disable smcup/rmcup to prevent alternate screen buffer issues
     subprocess.run(["tmux", "set", "-g", "terminal-overrides", "*:smcup@:rmcup@"])
@@ -1239,9 +1309,14 @@ def main():
     # --model and exec the real claude so the subagent gets 1M context.
     _agent_fastpath(args)
 
-    # Outer launches: force subagent spawns back through this wrapper so the
-    # --model strip happens. Inherited into child claude's env.
-    os.environ["CLAUDE_CODE_TEAMMATE_COMMAND"] = SELF_PATH
+    # 2026-06-11: teammate interception OFF by default. Letting claude resolve
+    # its own binary keeps lead/teammate versions matched (the ~/.local/bin
+    # symlink advances on auto-update, so routing spawns through it could pair
+    # an old lead with a new teammate). Set CLAUDE_TMUX_INTERCEPT_TEAMMATES=1
+    # to re-enable the _agent_fastpath --model strip (1M-context fix) if the
+    # 200K subagent cap ever comes back.
+    if os.environ.get("CLAUDE_TMUX_INTERCEPT_TEAMMATES"):
+        os.environ["CLAUDE_CODE_TEAMMATE_COMMAND"] = SELF_PATH
 
     # Multi-account routing.
     #   --setup <name>      Switch active account (migrates on first run). Exits.
