@@ -1271,7 +1271,7 @@ def print_help():
                       (symlinked into ~/.claude/skills/)
     --compact[=PCT]   Set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE — the % of the model's
                       context window at which auto-compact fires. ON BY DEFAULT
-                      at 60 (compact at ~60% used = ~600K of a 1M window). Range
+                      at 70 (compact at ~70% used = ~700K of a 1M window). Range
                       1-95; values >95 are silently ignored by Claude Code
                       (built-in cap). Pass --compact=75 etc. to override the
                       default percentage. Bare --compact is now redundant but
@@ -1292,7 +1292,7 @@ def print_help():
     claude                    Interactive menu for current workspace
     claude --list-all         Show all sessions with numbers
     claude --attach 2         Attach to session #2 from list
-    claude -- --resume        Start claude with --resume flag (auto-compact on @60%)
+    claude -- --resume        Start claude with --resume flag (auto-compact on @70%)
     claude --compact=80 -- --resume   Override auto-compact to 80% (~800K of 1M)
     claude --no-compact -- --resume   Disable wrapper's auto-compact override
     claude --kill 2           Kill session #2 from list
@@ -1357,8 +1357,8 @@ def main():
         # survives plugin updates. Silent when ECC isn't installed.
         neutralize_gateguard()
 
-    # Auto-compact is ON by default — we set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60
-    # (compact at ~60% used = ~600K of a 1M window) unless:
+    # Auto-compact is ON by default — we set CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+    # (compact at ~70% used = ~700K of a 1M window) unless:
     #   - user passed --no-compact (opt out entirely for this launch)
     #   - user passed --compact=PCT (explicit value, 1-95)
     #   - env var is already set (user shell override wins)
@@ -1371,7 +1371,7 @@ def main():
     # backfires (e.g. 400000 on 1M caps the usable window at 400K, then PCT
     # default ~95% fires compact at ~38% of the real window).
     compact_filtered = []
-    compact_value = "60"
+    compact_value = "70"
     disable_compact = False
     for a in args:
         if a == "--no-compact":
@@ -1384,13 +1384,13 @@ def main():
         compact_filtered.append(a)
     args = compact_filtered
 
-    # 2026-05-14: disabled — CLAUDE_AUTOCOMPACT_PCT_OVERRIDE behaviour is broken
-    # upstream (interactions with AUTO_COMPACT_WINDOW caused premature firing).
-    # Parser above still strips --compact / --no-compact so callers don't break,
-    # but we no longer set the env var. Re-enable here when the upstream knob
-    # is fixed, or remove the parser block too if we don't plan to come back.
-    # if not disable_compact and not os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"):
-    #     os.environ["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = compact_value
+    # 2026-06-21: re-enabled. The earlier "broken" rationale was the interaction
+    # with CLAUDE_CODE_AUTO_COMPACT_WINDOW, which is no longer set anywhere — so
+    # PCT_OVERRIDE now applies against the real 1M window as intended. Upstream
+    # may still fire slightly later than configured (anthropics/claude-code#36381),
+    # so treat 70 as a soft target rather than an exact trigger point.
+    if not disable_compact and not os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"):
+        os.environ["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = compact_value
 
     # Handle -- separator: args after -- are for claude, not for this wrapper
     if "--" in args:
